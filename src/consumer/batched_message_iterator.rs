@@ -48,9 +48,17 @@ impl Iterator for BatchedMessageIterator {
                 ..self.message_id.clone()
             };
 
+            // Per-message fields must be taken from `SingleMessageMetadata` and
+            // *not* inherited from the batch envelope. The presence/encoding flags
+            // in particular are per message: a batch can mix a binary (base64)
+            // key, an absent key and an absent value, and inheriting the
+            // envelope's values would report all of them wrongly.
             let metadata = Metadata {
                 properties: batched_message.metadata.properties,
                 partition_key: batched_message.metadata.partition_key,
+                partition_key_b64_encoded: batched_message.metadata.partition_key_b64_encoded,
+                null_partition_key: batched_message.metadata.null_partition_key,
+                null_value: batched_message.metadata.null_value,
                 ordering_key: batched_message.metadata.ordering_key,
                 event_time: batched_message.metadata.event_time,
                 ..self.metadata.clone()

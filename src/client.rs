@@ -8,7 +8,7 @@ use futures::{
 };
 
 use crate::{
-    connection::Authentication,
+    connection::{Authentication, BrokerFeatures},
     connection_manager::{
         BrokerAddress, ConnectionManager, ConnectionRetryOptions, OperationRetryOptions, TlsOptions,
     },
@@ -361,6 +361,37 @@ impl<Exe: Executor> Pulsar<Exe> {
             .map_err(|e| e.into())
     }
 
+    /// gets the number of partitions for a topic, controlling whether the lookup
+    /// may auto-create it
+    ///
+    /// [`lookup_partitioned_topic_number`][Self::lookup_partitioned_topic_number]
+    /// lets the broker auto-create the topic, which is the wrong default for
+    /// read-only questions like "does this topic exist". Passing
+    /// `metadata_auto_creation_enabled = false` (PIP-344) asks the broker to
+    /// report a missing topic as absent rather than creating it.
+    ///
+    /// A missing topic then surfaces as
+    /// `Error::ServiceDiscovery(ServiceDiscoveryError::Query(Some(ServerError::TopicNotFound), _))`,
+    /// not as `Ok(0)` — zero is the correct answer for an existing
+    /// *non-partitioned* topic, so the two cases must stay distinguishable.
+    ///
+    /// Brokers that predate PIP-344 cannot honour the request and would
+    /// auto-create anyway, so this fails with
+    /// [`ConnectionError::NotSupported`][crate::error::ConnectionError::NotSupported]
+    /// rather than creating the topic behind your back. Check
+    /// [`broker_features`][Self::broker_features] first if you need to branch.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn lookup_partitioned_topic_number_with_options<S: Into<String>>(
+        &self,
+        topic: S,
+        metadata_auto_creation_enabled: bool,
+    ) -> Result<u32, Error> {
+        self.service_discovery
+            .lookup_partitioned_topic_number_with_options(topic, metadata_auto_creation_enabled)
+            .await
+            .map_err(|e| e.into())
+    }
+
     /// gets the address of brokers handling the topic's partitions. If the topic is not
     /// a partitioned topic, result will be a single element containing the topic and address
     /// of the non-partitioned topic provided.
@@ -473,6 +504,27 @@ impl<Exe: Executor> Pulsar<Exe> {
     /// # Ok(())
     /// # }
     /// ```
+    /// Capabilities the broker advertised during the connection handshake.
+    ///
+    /// Useful for deciding whether an optional protocol feature can be used
+    /// before attempting it. Brokers that predate a flag report it as `false`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # async fn run(pulsar: pulsar::Pulsar<pulsar::TokioExecutor>) -> Result<(), pulsar::Error> {
+    /// if pulsar.broker_features().await?.supports_scalable_topics {
+    ///     // the broker speaks the Pulsar 5.0 `topic://` protocol
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn broker_features(&self) -> Result<BrokerFeatures, Error> {
+        let connection = self.manager.get_base_connection().await?;
+        Ok(connection.sender().broker_features())
+    }
+
     #[cfg(feature = "admin-api")]
     pub fn admin(&self, admin_url: impl Into<String>) -> Result<crate::AdminClient, Error> {
         crate::admin::AdminClient::new(

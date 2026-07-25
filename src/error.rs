@@ -91,6 +91,10 @@ pub enum ConnectionError {
     Disconnected,
     PulsarError(Option<crate::message::proto::ServerError>, Option<String>),
     Unexpected(String),
+    /// The broker lacks a protocol capability the requested operation needs.
+    ///
+    /// Not retriable: retrying against the same broker version cannot succeed.
+    NotSupported(String),
     Decoding(String),
     Encoding(String),
     SocketAddr(String),
@@ -211,6 +215,7 @@ impl fmt::Display for ConnectionError {
                 write!(f, "Server error ({:?}): {}", e, s.as_deref().unwrap_or(""))
             }
             ConnectionError::Unexpected(e) => write!(f, "{e}"),
+            ConnectionError::NotSupported(e) => write!(f, "not supported by the broker: {e}"),
             ConnectionError::Decoding(e) => write!(f, "Error decoding message: {e}"),
             ConnectionError::Encoding(e) => write!(f, "Error encoding message: {e}"),
             ConnectionError::SocketAddr(e) => write!(f, "Error obtaining socket address: {e}"),
@@ -251,6 +256,19 @@ pub enum ConsumerError {
     ChannelFull,
     Closed,
     BuildError,
+    /// The broker delivered a chunk of a chunked message.
+    ///
+    /// Chunk reassembly is not implemented. Returning the chunk to the
+    /// application would hand it a truncated payload that looks like a complete
+    /// message, so the message is rejected instead. Republish the data below the
+    /// broker's `maxMessageSize`, or consume it with a client that supports
+    /// chunking.
+    UnsupportedChunkedMessage {
+        /// `MessageMetadata.uuid` grouping the chunks, when the broker sent one.
+        uuid: Option<String>,
+        /// Total number of chunks the original message was split into.
+        num_chunks: i32,
+    },
 }
 
 impl From<ConnectionError> for ConsumerError {
@@ -294,6 +312,12 @@ impl fmt::Display for ConsumerError {
                 "cannot send message to the consumer engine: the channel is closed"
             ),
             ConsumerError::BuildError => write!(f, "Error while building the consumer."),
+            ConsumerError::UnsupportedChunkedMessage { uuid, num_chunks } => write!(
+                f,
+                "received chunk of a {num_chunks}-chunk message (uuid = {}), but chunked \
+                 message reassembly is not supported by this client",
+                uuid.as_deref().unwrap_or("<none>")
+            ),
         }
     }
 }

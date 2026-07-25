@@ -439,6 +439,8 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
         message: CommandMessage,
         mut payload: Payload,
     ) -> Result<(), Error> {
+        reject_chunked_message(&payload.metadata)?;
+
         let compression = match payload.metadata.compression {
             None => proto::CompressionType::None,
             Some(compression) => proto::CompressionType::try_from(compression).map_err(|err| {
@@ -704,5 +706,77 @@ impl<Exe: Executor> std::ops::Drop for ConsumerEngine<Exe> {
                 );
             }
         }));
+    }
+}
+
+/// Rejects a chunk of a chunked message.
+///
+/// Chunked publishing splits one logical message across several entries, each
+/// carrying only a slice of the payload. Reassembly is not implemented, so
+/// handing a chunk to the application would look like a complete message with a
+/// truncated payload — silent data corruption. Fail loudly instead.
+///
+/// A `num_chunks_from_msg` of `1` (or absent) is a normal unchunked message: the
+/// Java producer stamps the chunk fields even when chunking produced a single
+/// chunk.
+fn reject_chunked_message(metadata: &proto::MessageMetadata) -> Result<(), Error> {
+    match metadata.num_chunks_from_msg {
+        Some(num_chunks) if num_chunks > 1 => {
+            Err(Error::Consumer(ConsumerError::UnsupportedChunkedMessage {
+                uuid: metadata.uuid.clone(),
+                num_chunks,
+            }))
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    fn metadata(num_chunks: Option<i32>) -> proto::MessageMetadata {
+        proto::MessageMetadata {
+            producer_name: "test".to_string(),
+            sequence_id: 0,
+            publish_time: 0,
+            num_chunks_from_msg: num_chunks,
+            uuid: num_chunks.map(|_| "chunk-uuid".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// An ordinary message must pass through untouched.
+    #[test]
+    fn unchunked_message_is_accepted() {
+        assert!(reject_chunked_message(&metadata(None)).is_ok());
+    }
+
+    /// The Java producer stamps chunk metadata even when the message fit in one
+    /// chunk; that is not a chunked message and must not be rejected.
+    #[test]
+    fn single_chunk_message_is_accepted() {
+        assert!(reject_chunked_message(&metadata(Some(1))).is_ok());
+    }
+
+    /// A genuine chunk must be rejected rather than delivered truncated.
+    #[test]
+    fn multi_chunk_message_is_rejected() {
+        let err = reject_chunked_message(&metadata(Some(4))).unwrap_err();
+        match err {
+            Error::Consumer(ConsumerError::UnsupportedChunkedMessage { uuid, num_chunks }) => {
+                assert_eq!(num_chunks, 4);
+                assert_eq!(uuid.as_deref(), Some("chunk-uuid"));
+            }
+            other => panic!("expected UnsupportedChunkedMessage, got {other:?}"),
+        }
+        // The message must name the cause well enough to act on.
+        let rendered = reject_chunked_message(&metadata(Some(4)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            rendered.contains("chunk") && rendered.contains("4"),
+            "unhelpful error text: {rendered}"
+        );
     }
 }

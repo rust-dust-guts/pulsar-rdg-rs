@@ -23,6 +23,20 @@ pub struct ServiceDiscovery<Exe: Executor> {
     manager: Arc<ConnectionManager<Exe>>,
 }
 
+/// Whether `topic` names an individual partition of a partitioned topic, i.e.
+/// ends in `-partition-<digits>`.
+///
+/// Deliberately strict: a substring test would also match ordinary topics that
+/// merely contain the word, such as `orders-partition-archive`.
+fn is_topic_partition_name(topic: &str) -> bool {
+    match topic.rsplit_once("-partition-") {
+        Some((prefix, index)) => {
+            !prefix.is_empty() && !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 impl<Exe: Executor> ServiceDiscovery<Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn with_manager(manager: Arc<ConnectionManager<Exe>>) -> Self {
@@ -177,24 +191,54 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
     }
 
     /// get the number of partitions for a partitioned topic
+    ///
+    /// The lookup auto-creates the topic if the broker's auto-creation policy
+    /// allows it. Use
+    /// [`lookup_partitioned_topic_number_with_options`][Self::lookup_partitioned_topic_number_with_options]
+    /// to look up metadata without that side effect.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn lookup_partitioned_topic_number<S: Into<String>>(
         &self,
         topic: S,
     ) -> Result<u32, ServiceDiscoveryError> {
+        self.lookup_partitioned_topic_number_with_options(topic, true)
+            .await
+    }
+
+    /// get the number of partitions for a partitioned topic, controlling whether
+    /// the lookup may auto-create the topic
+    ///
+    /// With `metadata_auto_creation_enabled == false` (PIP-344) the broker does
+    /// not create a missing topic and instead reports it as absent, surfacing here
+    /// as `Query(Some(ServerError::TopicNotFound), _)`. Zero is *not* used for
+    /// "missing", because zero is also the correct answer for an existing
+    /// non-partitioned topic.
+    ///
+    /// Brokers that predate PIP-344 cannot honour the request, so the call fails
+    /// with [`ConnectionError::NotSupported`] rather than creating the topic
+    /// anyway.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn lookup_partitioned_topic_number_with_options<S: Into<String>>(
+        &self,
+        topic: S,
+        metadata_auto_creation_enabled: bool,
+    ) -> Result<u32, ServiceDiscoveryError> {
         let topic = topic.into();
 
-        // This is a fast path to reduce the number of lookup requests for topic partition metadata
-        // and as a side effect reduce amplification on zookeeper.
-        // For example, for a topic with 12 partitions, before this patch we did 13 lookup requests
-        // and now, we only did once.
-        // There are some cases where we ask if a partition of a topic is partitioned which could
-        // not be the case. We are able to detect those requests as the topic name is ending
-        // with '...-partition-<number>'. So, to be effective and avoid a regex here, we use
-        // the `contains` method to detect the pattern '-partition-'. if it matches the
-        // pattern as there is no partition in a partitioned topic, we could safely return that the
-        // partition number is 0, that implicitly say that there is only 1 topic and the index is 0.
-        if topic.contains("-partition-") {
+        // Fast path: a partition of a partitioned topic is itself never partitioned,
+        // so answering 0 locally saves one lookup per partition (13 -> 1 for a
+        // 12-partition topic) and the matching metadata-store reads.
+        //
+        // Two constraints on when it may be taken:
+        //
+        // * It must match only a real partition suffix (`-partition-<digits>` at
+        //   the end). A `contains` test also swallows ordinary topics such as
+        //   `orders-partition-archive`.
+        // * It must be skipped when auto-creation is disabled. The caller is then
+        //   asking whether the topic exists, and answering 0 from the name alone
+        //   would claim it does — and would also skip the broker-capability check
+        //   this method promises to make.
+        if metadata_auto_creation_enabled && is_topic_partition_name(&topic) {
             return Ok(0);
         }
 
@@ -204,12 +248,19 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
         let operation_retry_options = self.manager.operation_retry_options.clone();
 
         let response = loop {
-            let response = match connection.sender().lookup_partitioned_topic(&topic).await {
+            let response = match connection
+                .sender()
+                .lookup_partitioned_topic(&topic, metadata_auto_creation_enabled)
+                .await
+            {
                 Ok(res) => res,
                 Err(ConnectionError::Disconnected) => {
                     error!("tried to lookup a topic but connection was closed, reconnecting...");
                     connection = self.manager.get_base_connection().await?;
-                    connection.sender().lookup_partitioned_topic(&topic).await?
+                    connection
+                        .sender()
+                        .lookup_partitioned_topic(&topic, metadata_auto_creation_enabled)
+                        .await?
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -339,4 +390,45 @@ fn convert_lookup_response(
         redirect,
         authoritative,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_topic_partition_name;
+
+    /// Real partition suffixes must be recognised so the fast path still works.
+    #[test]
+    fn recognises_real_partition_names() {
+        for topic in [
+            "persistent://public/default/orders-partition-0",
+            "orders-partition-12",
+            "a-partition-999",
+        ] {
+            assert!(
+                is_topic_partition_name(topic),
+                "{topic} is a partition name"
+            );
+        }
+    }
+
+    /// Regression: a `contains("-partition-")` test also matched ordinary topics,
+    /// which then short-circuited to `Ok(0)` — reporting a nonexistent topic as an
+    /// existing non-partitioned one and skipping the PIP-344 capability check.
+    #[test]
+    fn rejects_ordinary_topics_containing_the_word_partition() {
+        for topic in [
+            "orders-partition-archive",
+            "orders-partition-",
+            "orders-partition-3x",
+            "orders-partition-0-backup",
+            "-partition-0",
+            "partition-0",
+            "orders",
+        ] {
+            assert!(
+                !is_topic_partition_name(topic),
+                "{topic} must not be treated as a partition name"
+            );
+        }
+    }
 }

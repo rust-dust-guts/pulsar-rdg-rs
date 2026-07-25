@@ -210,10 +210,16 @@ pub async fn retry_create_producer<Exe: Executor>(
                                 }
                             }
                             Err(e) => {
+                                // The broker rejected the pending producer — most
+                                // commonly it was fenced by an
+                                // `ExclusiveWithFencing` producer while queued.
+                                // Returning the partial producer here would hand
+                                // back a handle the broker has already refused.
                                 error!(
-                                    "TopicProducer::create({topic}) wait_for_exclusive_access \
-                                     failed: {e:?}, proceeding with initial schema_version"
+                                    "TopicProducer::create({topic}) \
+                                     wait_for_exclusive_access failed: {e:?}"
                                 );
+                                return Err(e.into());
                             }
                         }
                     }

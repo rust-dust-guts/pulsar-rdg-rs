@@ -517,7 +517,7 @@ mod tests {
     async fn multi_consumer() {
         let _result = log::set_logger(&MULTI_LOGGER);
         log::set_max_level(LevelFilter::Debug);
-        let addr = "pulsar://127.0.0.1:6650";
+        let addr = crate::test_utils::broker_url();
 
         let topic_n: u16 = rand::random();
         let topic1 = format!("multi_consumer_a_{topic_n}");
@@ -696,7 +696,7 @@ mod tests {
     async fn consumer_zero_receiver_queue_size() {
         let _result = log::set_logger(&TEST_LOGGER);
         log::set_max_level(LevelFilter::Debug);
-        let addr = "pulsar://127.0.0.1:6650";
+        let addr = crate::test_utils::broker_url();
         let topic = format!(
             "consumer_zero_receiver_queue_size_{}",
             rand::random::<u16>()
@@ -731,7 +731,7 @@ mod tests {
         use rand::{distributions::Alphanumeric, Rng};
         let _result = log::set_logger(&TEST_LOGGER);
         log::set_max_level(LevelFilter::Debug);
-        let addr = "pulsar://127.0.0.1:6650";
+        let addr = crate::test_utils::broker_url();
 
         let topic = format!(
             "consumer_dropped_with_lingering_acks_{}",
@@ -844,7 +844,7 @@ mod tests {
     async fn dead_letter_queue() {
         let _result = log::set_logger(&TEST_LOGGER);
         log::set_max_level(LevelFilter::Debug);
-        let addr = "pulsar://127.0.0.1:6650";
+        let addr = crate::test_utils::broker_url();
 
         let test_id: u16 = rand::random();
         let topic = format!("dead_letter_queue_test_{test_id}");
@@ -984,7 +984,7 @@ mod tests {
 
         let _result = log::set_logger(&TEST_LOGGER);
         log::set_max_level(LevelFilter::Debug);
-        let addr = "pulsar://127.0.0.1:6650";
+        let addr = crate::test_utils::broker_url();
 
         let test_id: u16 = rand::random();
         let topic = format!("dead_letter_queue_batched_test_{test_id}");
@@ -1158,7 +1158,7 @@ mod tests {
     async fn failover() {
         let _result = log::set_logger(&MULTI_LOGGER);
         log::set_max_level(LevelFilter::Debug);
-        let addr = "pulsar://127.0.0.1:6650";
+        let addr = crate::test_utils::broker_url();
         let topic = format!("failover_{}", rand::random::<u16>());
         let client: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
 
@@ -1223,7 +1223,7 @@ mod tests {
         let _result = log::set_logger(&MULTI_LOGGER);
         log::set_max_level(LevelFilter::Debug);
         log::info!("starting seek test");
-        let addr = "pulsar://127.0.0.1:6650";
+        let addr = crate::test_utils::broker_url();
         let topic = format!("seek_{}", rand::random::<u16>());
         let client: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
 
@@ -1361,7 +1361,7 @@ mod tests {
         let _result = log::set_logger(&MULTI_LOGGER);
         log::set_max_level(LevelFilter::Debug);
         log::info!("starting schema test");
-        let addr = "pulsar://127.0.0.1:6650";
+        let addr = crate::test_utils::broker_url();
         let topic = format!("schema_{}", rand::random::<u16>());
         let client: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
 
@@ -1496,7 +1496,7 @@ mod tests {
     }
 
     async fn new_client() -> Pulsar<TokioExecutor> {
-        let addr = "pulsar://127.0.0.1:6650";
+        let addr = crate::test_utils::broker_url();
         Pulsar::builder(addr, TokioExecutor).build().await.unwrap()
     }
 

@@ -305,6 +305,50 @@ enum SendChannel {
 
 /// An owned type that can send messages like a connection
 //#[derive(Clone)]
+/// Capabilities the broker advertised in `CommandConnected.feature_flags`.
+///
+/// Brokers older than a given flag simply omit it, and brokers predating
+/// `feature_flags` entirely omit the whole message field, so every capability
+/// defaults to `false` and callers must degrade gracefully rather than assume.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BrokerFeatures {
+    /// Broker accepts `CommandWatchTopicList` for pattern subscriptions.
+    pub supports_topic_watchers: bool,
+    /// Broker honours `CommandPartitionedTopicMetadata.metadata_auto_creation_enabled`
+    /// (PIP-344). Without it, a metadata lookup always auto-creates the topic.
+    pub supports_get_partitioned_metadata_without_auto_creation: bool,
+    /// Broker dedups replicated messages by ledger and entry id.
+    pub supports_repl_dedup_by_lid_and_eid: bool,
+    /// Broker supports reconciling a topic watcher after a reconnect.
+    pub supports_topic_watcher_reconcile: bool,
+    /// Broker supports Pulsar 5.0 scalable topics (`topic://`).
+    pub supports_scalable_topics: bool,
+    /// Broker supports transaction-coordinator discovery via watch.
+    pub supports_tc_metadata_discovery: bool,
+}
+
+impl From<Option<&proto::FeatureFlags>> for BrokerFeatures {
+    fn from(flags: Option<&proto::FeatureFlags>) -> Self {
+        let Some(flags) = flags else {
+            return BrokerFeatures::default();
+        };
+        BrokerFeatures {
+            supports_topic_watchers: flags.supports_topic_watchers.unwrap_or(false),
+            supports_get_partitioned_metadata_without_auto_creation: flags
+                .supports_get_partitioned_metadata_without_auto_creation
+                .unwrap_or(false),
+            supports_repl_dedup_by_lid_and_eid: flags
+                .supports_repl_dedup_by_lid_and_eid
+                .unwrap_or(false),
+            supports_topic_watcher_reconcile: flags
+                .supports_topic_watcher_reconcile
+                .unwrap_or(false),
+            supports_scalable_topics: flags.supports_scalable_topics.unwrap_or(false),
+            supports_tc_metadata_discovery: flags.supports_tc_metadata_discovery.unwrap_or(false),
+        }
+    }
+}
+
 pub struct ConnectionSender<Exe: Executor> {
     connection_id: Uuid,
     data_tx: async_channel::Sender<Message>,
@@ -315,6 +359,7 @@ pub struct ConnectionSender<Exe: Executor> {
     error: SharedError,
     executor: Arc<Exe>,
     operation_timeout: Duration,
+    broker_features: BrokerFeatures,
 }
 
 impl<Exe: Executor> ConnectionSender<Exe> {
@@ -329,6 +374,7 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         error: SharedError,
         executor: Arc<Exe>,
         operation_timeout: Duration,
+        broker_features: BrokerFeatures,
     ) -> ConnectionSender<Exe> {
         ConnectionSender {
             connection_id,
@@ -340,7 +386,14 @@ impl<Exe: Executor> ConnectionSender<Exe> {
             error,
             executor,
             operation_timeout,
+            broker_features,
         }
+    }
+
+    /// Capabilities the broker advertised during the handshake.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub(crate) fn broker_features(&self) -> BrokerFeatures {
+        self.broker_features
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
@@ -428,9 +481,28 @@ impl<Exe: Executor> ConnectionSender<Exe> {
     pub async fn lookup_partitioned_topic<S: Into<String>>(
         &self,
         topic: S,
+        metadata_auto_creation_enabled: bool,
     ) -> Result<proto::CommandPartitionedTopicMetadataResponse, ConnectionError> {
+        // PIP-344: an older broker ignores the flag and auto-creates regardless.
+        // Silently creating a topic the caller explicitly asked us not to create
+        // is worse than failing, so refuse rather than guess.
+        if !metadata_auto_creation_enabled
+            && !self
+                .broker_features
+                .supports_get_partitioned_metadata_without_auto_creation
+        {
+            return Err(ConnectionError::NotSupported(
+                "this broker does not support looking up partition metadata without                  auto-creating the topic (PIP-344); upgrade the broker or allow                  auto-creation"
+                    .to_string(),
+            ));
+        }
+
         let request_id = self.request_id.get();
-        let msg = messages::lookup_partitioned_topic(topic.into(), request_id);
+        let msg = messages::lookup_partitioned_topic(
+            topic.into(),
+            request_id,
+            metadata_auto_creation_enabled,
+        );
         self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
             resp.command.partition_metadata_response
         })
@@ -1248,7 +1320,7 @@ impl<Exe: Executor> Connection<Exe> {
             .await?;
 
         let msg = stream.next().await;
-        match msg {
+        let connected = match msg {
             Some(Ok(Message {
                 command:
                     proto::BaseCommand {
@@ -1273,6 +1345,12 @@ impl<Exe: Executor> Connection<Exe> {
             Some(Err(e)) => Err(e),
             None => Err(ConnectionError::Disconnected),
         }?;
+
+        let broker_features = BrokerFeatures::from(connected.feature_flags.as_ref());
+        debug!(
+            "broker {} advertised {:?}",
+            connected.server_version, broker_features
+        );
 
         let (mut sink, stream) = stream.split();
         // Data plane: bounded so that producer Send commands experience natural
@@ -1367,6 +1445,7 @@ impl<Exe: Executor> Connection<Exe> {
             error,
             executor.clone(),
             operation_timeout,
+            broker_features,
         );
 
         Ok(sender)
@@ -1445,6 +1524,37 @@ pub(crate) mod messages {
     };
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    /// Capabilities this client advertises to the broker in `CommandConnect`.
+    ///
+    /// A flag here is a promise, so only features that are actually implemented
+    /// may be set — the broker changes what it sends based on these.
+    ///
+    /// Deliberately **not** advertised:
+    /// * `supports_broker_entry_metadata` — the broker would prepend
+    ///   `BrokerEntryMetadata` to every entry and this client does not parse it,
+    ///   which would corrupt every payload.
+    /// * `supports_topic_watchers` / `supports_topic_watcher_reconcile` —
+    ///   `CommandWatchTopicList` is not implemented; pattern consumers poll.
+    /// * `supports_scalable_topics` / `supports_tc_metadata_discovery` — the
+    ///   Pulsar 5.0 scalable-topic and transaction-coordinator protocols are not
+    ///   implemented.
+    /// * `supports_repl_dedup_by_lid_and_eid` — only consulted for replication
+    ///   producers, which this client cannot be.
+    pub(super) fn client_feature_flags() -> proto::FeatureFlags {
+        proto::FeatureFlags {
+            // Without this the broker closes the connection instead of issuing a
+            // `CommandAuthChallenge` when credentials expire; `auth_challenge`
+            // handles the challenge, so the refresh path works.
+            supports_auth_refresh: Some(true),
+            // `retry_create_producer` handles `producer_ready == false`.
+            supports_partial_producer: Some(true),
+            // `lookup_partitioned_topic_number_with_options` can ask for metadata
+            // without auto-creating the topic.
+            supports_get_partitioned_metadata_without_auto_creation: Some(true),
+            ..Default::default()
+        }
+    }
+
     pub fn connect(auth: Option<Authentication>, proxy_to_broker_url: Option<String>) -> Message {
         let (auth_method_name, auth_data) = match auth {
             Some(auth) => (Some(auth.name), Some(auth.data)),
@@ -1460,6 +1570,7 @@ pub(crate) mod messages {
                     proxy_to_broker_url,
                     client_version: proto::client_version(),
                     protocol_version: Some(12),
+                    feature_flags: Some(client_feature_flags()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1632,13 +1743,18 @@ pub(crate) mod messages {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub fn lookup_partitioned_topic(topic: String, request_id: u64) -> Message {
+    pub fn lookup_partitioned_topic(
+        topic: String,
+        request_id: u64,
+        metadata_auto_creation_enabled: bool,
+    ) -> Message {
         Message {
             command: proto::BaseCommand {
                 r#type: CommandType::PartitionedMetadata as i32,
                 partition_metadata: Some(proto::CommandPartitionedTopicMetadata {
                     topic,
                     request_id,
+                    metadata_auto_creation_enabled: Some(metadata_auto_creation_enabled),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1685,6 +1801,7 @@ pub(crate) mod messages {
                 close_producer: Some(proto::CommandCloseProducer {
                     producer_id,
                     request_id,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -1805,6 +1922,7 @@ pub(crate) mod messages {
                 close_consumer: Some(proto::CommandCloseConsumer {
                     consumer_id,
                     request_id,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -1870,6 +1988,106 @@ pub(crate) mod messages {
 
 #[cfg(test)]
 mod tests {
+    /// The broker may omit `feature_flags` entirely (older brokers), which must
+    /// read as "supports nothing" rather than panicking or defaulting to true.
+    #[test]
+    fn broker_features_absent_means_nothing_supported() {
+        assert_eq!(BrokerFeatures::from(None), BrokerFeatures::default());
+        let all_false = BrokerFeatures::from(None);
+        assert!(!all_false.supports_scalable_topics);
+        assert!(!all_false.supports_topic_watchers);
+        assert!(!all_false.supports_get_partitioned_metadata_without_auto_creation);
+    }
+
+    /// Each broker flag must map to its own field; a copy/paste slip here would
+    /// silently enable the wrong protocol path.
+    #[test]
+    fn broker_features_map_each_flag_independently() {
+        let flags = proto::FeatureFlags {
+            supports_topic_watchers: Some(true),
+            supports_get_partitioned_metadata_without_auto_creation: Some(true),
+            supports_repl_dedup_by_lid_and_eid: Some(false),
+            supports_topic_watcher_reconcile: Some(true),
+            supports_scalable_topics: Some(true),
+            supports_tc_metadata_discovery: Some(false),
+            ..Default::default()
+        };
+        let features = BrokerFeatures::from(Some(&flags));
+        assert!(features.supports_topic_watchers);
+        assert!(features.supports_get_partitioned_metadata_without_auto_creation);
+        assert!(!features.supports_repl_dedup_by_lid_and_eid);
+        assert!(features.supports_topic_watcher_reconcile);
+        assert!(features.supports_scalable_topics);
+        assert!(!features.supports_tc_metadata_discovery);
+    }
+
+    /// A flag we advertise is a promise the broker acts on. These three are
+    /// implemented, so advertising them is correct.
+    #[test]
+    fn advertises_only_implemented_capabilities() {
+        let flags = messages::client_feature_flags();
+        assert_eq!(flags.supports_auth_refresh, Some(true));
+        assert_eq!(flags.supports_partial_producer, Some(true));
+        assert_eq!(
+            flags.supports_get_partitioned_metadata_without_auto_creation,
+            Some(true)
+        );
+    }
+
+    /// Regression guard: advertising any of these would change what the broker
+    /// sends in ways this client cannot handle.
+    ///
+    /// `supports_broker_entry_metadata` is the dangerous one — the broker would
+    /// prepend `BrokerEntryMetadata` to every entry, which the payload parser
+    /// does not skip, corrupting every message.
+    #[test]
+    fn does_not_advertise_unimplemented_capabilities() {
+        let flags = messages::client_feature_flags();
+        for (name, value) in [
+            (
+                "supports_broker_entry_metadata",
+                flags.supports_broker_entry_metadata,
+            ),
+            ("supports_topic_watchers", flags.supports_topic_watchers),
+            (
+                "supports_topic_watcher_reconcile",
+                flags.supports_topic_watcher_reconcile,
+            ),
+            ("supports_scalable_topics", flags.supports_scalable_topics),
+            (
+                "supports_tc_metadata_discovery",
+                flags.supports_tc_metadata_discovery,
+            ),
+        ] {
+            assert!(
+                value != Some(true),
+                "{name} must not be advertised until it is implemented"
+            );
+        }
+    }
+
+    /// `CommandConnect` must carry the flags, otherwise the broker assumes an
+    /// ancient client and, among other things, drops the connection instead of
+    /// refreshing expired credentials.
+    #[test]
+    fn connect_command_carries_feature_flags() {
+        let msg = messages::connect(None, None);
+        let connect = msg.command.connect.expect("connect command");
+        let flags = connect.feature_flags.expect("feature flags present");
+        assert_eq!(flags.supports_auth_refresh, Some(true));
+    }
+
+    /// The PIP-344 flag must be sent explicitly rather than left to the proto
+    /// default, so that an intermediary cannot reinterpret its absence.
+    #[test]
+    fn partition_metadata_request_states_auto_creation_explicitly() {
+        for enabled in [true, false] {
+            let msg = messages::lookup_partitioned_topic("t".to_string(), 1, enabled);
+            let req = msg.command.partition_metadata.expect("partition metadata");
+            assert_eq!(req.metadata_auto_creation_enabled, Some(enabled));
+        }
+    }
+
     use std::{sync::Arc, time::Duration};
 
     use async_trait::async_trait;
@@ -1882,7 +2100,7 @@ mod tests {
     use tokio::{net::TcpListener, sync::RwLock};
     use uuid::Uuid;
 
-    use super::{Connection, Receiver};
+    use super::{messages, proto, BrokerFeatures, Connection, Receiver};
     #[cfg(any(
         feature = "tokio-runtime",
         feature = "tokio-rustls-runtime-aws-lc-rs",

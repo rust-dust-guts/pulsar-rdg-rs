@@ -2,6 +2,7 @@
 use std::{
     collections::{btree_map::Entry, BTreeMap, HashMap, VecDeque},
     io::Write,
+    num::NonZeroUsize,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -30,7 +31,7 @@ use crate::{
     },
     proto::CommandSuccess,
     retry_op::retry_create_producer,
-    routing_policy::RoutingPolicy,
+    routing_policy::{HashingScheme, RoutingPolicy},
     BrokerAddress, Error, Pulsar,
 };
 
@@ -164,6 +165,12 @@ pub struct ProducerOptions {
     /// [`Producer::send_non_blocking`]. (default: false)
     pub block_queue_if_full: bool,
     pub routing_policy: Option<RoutingPolicy>,
+    /// hash function used to map a message's partition key to a partition
+    ///
+    /// Defaults to [`HashingScheme::JavaStringHash`], matching the Java client,
+    /// so that the same key routes to the same partition across clients. Only
+    /// change this if every other producer on the topic uses the same scheme.
+    pub hashing_scheme: HashingScheme,
 }
 
 impl ProducerOptions {
@@ -543,21 +550,44 @@ impl<Exe: Executor> PartitionedProducer<Exe> {
             .unwrap()
     }
 
+    /// Routes a keyed message to the partition owning its key hash.
+    ///
+    /// A partition key always supersedes the routing policy, matching
+    /// `RoundRobinPartitionMessageRouterImpl` and
+    /// `SinglePartitionMessageRouterImpl` in the Java client.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    fn route_by_key(&mut self, partition_key: &str) -> &mut TopicProducer<Exe> {
+        // `producers` is non-empty by construction: `build` errors on zero
+        // partitions and takes the `Single` path for exactly one.
+        let partition_count = NonZeroUsize::new(self.producers.len())
+            .expect("a PartitionedProducer always has at least one partition");
+        let index = RoutingPolicy::compute_partition_index_for_key(
+            partition_key,
+            partition_count,
+            self.options.hashing_scheme,
+        );
+        self.producers.get_mut(index).unwrap()
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn choose_partition(&mut self, message: &Message) -> &mut TopicProducer<Exe> {
+        // A partition key supersedes the routing policy, so that the same key
+        // always lands on the same partition regardless of how this producer is
+        // configured. `Custom` is the exception: the user's router decides
+        // everything, keyed or not, as in Java's `CustomPartition` mode.
+        //
+        // This applies to `None` too, which behaves as `RoundRobin` — that is the
+        // default path, so a key being ignored there would break ordering for
+        // every producer that never sets a policy.
+        let hash_routed_key = match &self.options.routing_policy {
+            Some(RoutingPolicy::Custom(_)) => None,
+            _ => message.partition_key.as_deref(),
+        };
+        if let Some(partition_key) = hash_routed_key {
+            return self.route_by_key(partition_key);
+        }
+
         match &self.options.routing_policy {
-            Some(RoutingPolicy::RoundRobin) => {
-                // If the message has a partition key, use it
-                if let Some(partition_key) = &message.partition_key {
-                    let index = RoutingPolicy::compute_partition_index_for_key(
-                        partition_key,
-                        self.producers.len(),
-                    );
-                    return self.producers.get_mut(index).unwrap();
-                }
-                // If not, use round robin
-                self.get_next_round_robin_producer()
-            }
             Some(RoutingPolicy::Single) => self
                 .producers
                 .get_mut(self.last_used_producer_index)
@@ -568,7 +598,7 @@ impl<Exe: Executor> PartitionedProducer<Exe> {
                     .get_mut(policy.route(message, amount_of_producers))
                     .unwrap()
             }
-            None => self.get_next_round_robin_producer(),
+            Some(RoutingPolicy::RoundRobin) | None => self.get_next_round_robin_producer(),
         }
     }
 }
@@ -1559,7 +1589,7 @@ mod tests {
     async fn block_if_queue_full() {
         let _result = log::set_logger(&TEST_LOGGER);
         log::set_max_level(LevelFilter::Debug);
-        let pulsar: Pulsar<_> = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+        let pulsar: Pulsar<_> = Pulsar::builder(test_utils::broker_url(), TokioExecutor)
             .with_outbound_channel_size(3)
             .build()
             .await
@@ -1613,7 +1643,7 @@ mod tests {
     async fn move_producer_to_spawned_task() {
         let _result = log::set_logger(&TEST_LOGGER);
         log::set_max_level(LevelFilter::Debug);
-        let pulsar: Pulsar<_> = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+        let pulsar: Pulsar<_> = Pulsar::builder(test_utils::broker_url(), TokioExecutor)
             .with_outbound_channel_size(3)
             .build()
             .await
@@ -1635,7 +1665,7 @@ mod tests {
     async fn test_round_robin_routing_policy() {
         let _result = log::set_logger(&TEST_LOGGER);
         log::set_max_level(LevelFilter::Debug);
-        let pulsar: Pulsar<_> = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+        let pulsar: Pulsar<_> = Pulsar::builder(test_utils::broker_url(), TokioExecutor)
             .build()
             .await
             .unwrap();
@@ -1705,7 +1735,7 @@ mod tests {
     async fn test_single_routing_policy() {
         let _result = log::set_logger(&TEST_LOGGER);
         log::set_max_level(LevelFilter::Debug);
-        let pulsar: Pulsar<_> = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+        let pulsar: Pulsar<_> = Pulsar::builder(test_utils::broker_url(), TokioExecutor)
             .build()
             .await
             .unwrap();
@@ -1756,6 +1786,219 @@ mod tests {
         }
     }
 
+    /// Produces a keyed message per golden vector and asserts the broker
+    /// received it on the partition the Java client would have chosen.
+    ///
+    /// The unit tests in [`crate::routing_policy`] pin the hash arithmetic; this
+    /// pins the wiring — that `choose_partition` actually consults the key, uses
+    /// the configured scheme, and maps the index to the right partition topic.
+    /// Together they are what stops a Rust producer from silently interleaving
+    /// keys against a Java producer on the same topic.
+    async fn assert_keys_land_on_java_partitions(
+        routing_policy: Option<RoutingPolicy>,
+        hashing_scheme: HashingScheme,
+    ) {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use futures::TryStreamExt;
+
+        use crate::{
+            consumer::InitialPosition,
+            routing_policy::java_vectors::{PARTITION_COUNTS, VECTORS},
+            Consumer, ConsumerOptions, SubType,
+        };
+
+        // Index of the partition count under test within the golden table.
+        // Must be a partition count for which clearing Murmur's sign bit can
+        // actually change the chosen partition. Masking subtracts exactly 2^31, so
+        // for any power-of-two count (2, 4, 8, 16, 64) `raw % n == masked % n` and
+        // the test could not detect a missing mask at all. 7 is coprime to 2^31.
+        const COUNT_INDEX: usize = 4;
+        let partition_count = PARTITION_COUNTS[COUNT_INDEX];
+        assert!(
+            !(1u64 << 31).is_multiple_of(u64::from(partition_count)),
+            "partition count {partition_count} cannot distinguish masked from unmasked hashes"
+        );
+
+        let pulsar: Pulsar<_> = Pulsar::builder(test_utils::broker_url(), TokioExecutor)
+            .build()
+            .await
+            .unwrap();
+        let topic = format!("test_key_placement_{}", rand::random::<u32>());
+        test_utils::create_partitioned_topic("public", "default", &topic, partition_count).await;
+
+        let expected_partition =
+            |v: &crate::routing_policy::java_vectors::HashVector| match hashing_scheme {
+                HashingScheme::JavaStringHash => v.jsh_partitions[COUNT_INDEX],
+                HashingScheme::Murmur3_32Hash => v.m3_partitions[COUNT_INDEX],
+            };
+
+        // Pick keys deliberately rather than taking a prefix of the table, which
+        // would be all ASCII. The interesting classes are:
+        //   * ASCII, including every tail length mod 4 (Murmur's tail handling)
+        //   * BMP multi-byte UTF-8
+        //   * non-BMP, where Java's UTF-16 `hashCode` sees two surrogate halves
+        //   * keys whose raw Murmur hash has bit 31 set, which are exactly the
+        //     ones the missing mask used to misroute
+        let non_bmp = |k: &str| k.chars().any(|c| c as u32 > 0xFFFF);
+        let non_ascii_bmp = |k: &str| !k.is_ascii() && !non_bmp(k);
+        let bit31_set =
+            |k: &str| murmur3::murmur3_32(&mut k.as_bytes(), 0).unwrap() & (1 << 31) != 0;
+
+        let mut keys: Vec<&'static str> = Vec::new();
+        let push = |keys: &mut Vec<&'static str>, k: &'static str| {
+            if !k.is_empty() && !keys.contains(&k) {
+                keys.push(k);
+            }
+        };
+        // An empty key is not a key as far as the broker is concerned, so it is
+        // covered by the unit vectors only.
+        for v in VECTORS.iter().filter(|v| non_bmp(v.key)) {
+            push(&mut keys, v.key);
+        }
+        for v in VECTORS.iter().filter(|v| non_ascii_bmp(v.key)) {
+            push(&mut keys, v.key);
+        }
+        for v in VECTORS.iter().filter(|v| bit31_set(v.key)).take(8) {
+            push(&mut keys, v.key);
+        }
+        for v in VECTORS.iter().take(12) {
+            push(&mut keys, v.key);
+        }
+
+        assert!(
+            keys.iter().any(|k| non_bmp(k))
+                && keys.iter().any(|k| non_ascii_bmp(k))
+                && keys.iter().any(|k| bit31_set(k)),
+            "key selection must cover non-BMP, BMP-non-ASCII and bit-31-set keys"
+        );
+
+        let mut want: BTreeMap<&str, u32> = BTreeMap::new();
+        for v in VECTORS.iter().filter(|v| keys.contains(&v.key)) {
+            want.insert(v.key, expected_partition(v));
+        }
+        assert!(
+            want.values().collect::<BTreeSet<_>>().len() > 1,
+            "test would be vacuous if every key routed to one partition"
+        );
+
+        let mut producer = pulsar
+            .producer()
+            .with_topic(&topic)
+            .with_options(ProducerOptions {
+                routing_policy,
+                hashing_scheme,
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+
+        for key in &keys {
+            producer
+                .create_message()
+                .with_content(key.to_string())
+                .with_partition_key(*key)
+                .send_non_blocking()
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+        producer.close().await.unwrap();
+
+        // Read each partition topic directly and record which keys arrived there.
+        let mut got: BTreeMap<&str, u32> = BTreeMap::new();
+        for partition in 0..partition_count {
+            let partition_topic =
+                format!("persistent://public/default/{topic}-partition-{partition}");
+            let mut consumer: Consumer<String, _> = pulsar
+                .consumer()
+                .with_topic(&partition_topic)
+                .with_subscription(format!("verify_{partition}"))
+                .with_subscription_type(SubType::Exclusive)
+                .with_options(
+                    ConsumerOptions::default().with_initial_position(InitialPosition::Earliest),
+                )
+                .build()
+                .await
+                .unwrap();
+
+            // Drain until the partition goes quiet; every message was acked by the
+            // producer before we subscribed, so nothing is still in flight. A
+            // consumer error must surface rather than read as "partition empty",
+            // otherwise a broken consumer is indistinguishable from a routing
+            // mismatch.
+            loop {
+                let msg = match tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    consumer.try_next(),
+                )
+                .await
+                {
+                    // Timed out or stream ended: this partition has no more messages.
+                    Err(_) | Ok(Ok(None)) => break,
+                    Ok(Ok(Some(msg))) => msg,
+                    Ok(Err(e)) => panic!("consumer error on partition {partition}: {e}"),
+                };
+
+                let key = msg.key().expect("produced messages all carry a key");
+                let key = keys
+                    .iter()
+                    .find(|k| **k == key)
+                    .unwrap_or_else(|| panic!("unexpected key {key:?} on partition {partition}"));
+                assert!(
+                    got.insert(key, partition).is_none(),
+                    "key {key:?} delivered more than once"
+                );
+                consumer.ack(&msg).await.unwrap();
+            }
+            consumer.close().await.unwrap();
+        }
+
+        assert_eq!(
+            got, want,
+            "{hashing_scheme:?}: keys landed on different partitions than the Java client would pick"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_messages_land_on_java_partitions_java_string_hash() {
+        assert_keys_land_on_java_partitions(
+            Some(RoutingPolicy::RoundRobin),
+            HashingScheme::JavaStringHash,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn keyed_messages_land_on_java_partitions_murmur3() {
+        assert_keys_land_on_java_partitions(
+            Some(RoutingPolicy::RoundRobin),
+            HashingScheme::Murmur3_32Hash,
+        )
+        .await;
+    }
+
+    /// `RoutingPolicy::Single` must still hash-route keyed messages, matching
+    /// `SinglePartitionMessageRouterImpl`. Before this was fixed every keyed
+    /// message went to whichever partition the producer happened to be pinned to.
+    #[tokio::test]
+    async fn keyed_messages_land_on_java_partitions_single_policy() {
+        assert_keys_land_on_java_partitions(
+            Some(RoutingPolicy::Single),
+            HashingScheme::JavaStringHash,
+        )
+        .await;
+    }
+
+    /// The default path: no routing policy configured at all. This is what most
+    /// producers use, so it is the case that matters most.
+    #[tokio::test]
+    async fn keyed_messages_land_on_java_partitions_default_policy() {
+        assert_keys_land_on_java_partitions(None, HashingScheme::default()).await;
+    }
+
     struct TestCustomRoutingPolicy {}
 
     impl CustomRoutingPolicy for TestCustomRoutingPolicy {
@@ -1768,7 +2011,7 @@ mod tests {
     async fn test_custom_routing_policy() {
         let _result = log::set_logger(&TEST_LOGGER);
         log::set_max_level(LevelFilter::Debug);
-        let pulsar: Pulsar<_> = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+        let pulsar: Pulsar<_> = Pulsar::builder(test_utils::broker_url(), TokioExecutor)
             .build()
             .await
             .unwrap();

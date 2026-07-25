@@ -224,13 +224,13 @@ mod tests {
 
     #[tokio::test]
     async fn reader() {
-        let addr = "pulsar://127.0.0.1:6650";
+        let addr = crate::test_utils::broker_url();
         let topic = format!("test_reader_{}", rand::random::<u16>());
         let dead_letter_policy = DeadLetterPolicy {
             max_redeliver_count: 1,
             dead_letter_topic: format!("{}_dead_letter", &topic),
         };
-        let client: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
+        let client: Pulsar<_> = Pulsar::builder(&addr, TokioExecutor).build().await.unwrap();
         let mut reader: Reader<TestData, _> = client
             .reader()
             .with_topic(&topic)

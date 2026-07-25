@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pulsar-version: [2.11.4, 3.0.8, 3.2.4, 3.3.3, 4.0.1, 4.1.2]
+        pulsar-version: [2.11.4, 3.0.8, 3.2.4, 3.3.3, 4.0.1, 4.1.2, 5.0.0-M1]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -47,43 +47,83 @@ jobs:
 
       - name: Start Pulsar Standalone Container
         run: |
+          # `bin/pulsar standalone` does NOT apply PULSAR_PREFIX_* on its own, so
+          # apply-config-from-env.py must run first — without it every -e below is
+          # silently ignored and the run only works because the defaults happen to
+          # match the port mapping. Notably advertisedAddress would stay empty, so
+          # topic lookup would hand the client the container hostname and the suite
+          # would depend on the runner being able to route to container IPs.
           docker run --name pulsar \
             -p 6650:6650 -p 8080:8080 \
             -d \
             -e GITHUB_ACTIONS=true -e CI=true \
             -e PULSAR_PREFIX_advertisedAddress=127.0.0.1 \
-            -e PULSAR_PREFIX_advertisedListeners=pulsar://127.0.0.1:6650 \
             -e PULSAR_PREFIX_brokerServicePort=6650 \
             -e PULSAR_PREFIX_webServicePort=8080 \
             -e PULSAR_PREFIX_topicLevelPoliciesEnabled=true \
             apachepulsar/pulsar:${{ matrix.pulsar-version }} \
-            bin/pulsar standalone
+            sh -c '
+              set -e
+              bin/apply-config-from-env.py conf/standalone.conf
+              # Assert here, in the same shell and before the broker starts, so the
+              # check cannot race the rewrite. A separate step would only know that
+              # PID 1 had started, not that the rewrite had finished.
+              grep -qx "advertisedAddress=127.0.0.1" conf/standalone.conf
+              grep -qx "brokerServicePort=6650" conf/standalone.conf
+              grep -qx "webServicePort=8080" conf/standalone.conf
+              echo "PULSAR_PREFIX_* overrides applied"
+              exec bin/pulsar standalone
+            '
 
       - name: Wait for Pulsar readiness
-        timeout-minutes: 3
+        # Generous relative to the shared deadline below, so the deadline (which
+        # dumps broker logs) is what fires on a slow start, not the step timeout.
+        timeout-minutes: 8
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Waiting for 6650..."
-          for i in {1..90}; do
-            (echo > /dev/tcp/127.0.0.1/6650) >/dev/null 2>&1 && break
-            sleep 1
-          done
-          (echo > /dev/tcp/127.0.0.1/6650) >/dev/null 2>&1 || { echo "Port 6650 not ready"; exit 1; }
+          # One deadline covering all three stages. Three independent 90s waits can
+          # legitimately sum past a 3-minute step timeout, which would kill the job
+          # before the diagnostic dump below ever runs.
+          deadline=$(( SECONDS + 300 ))
 
-          echo "Waiting for HTTP health..."
-          for i in {1..90}; do
-            if curl -sf http://127.0.0.1:8080/admin/v2/brokers/health >/dev/null; then
-              echo "Broker health OK"
-              exit 0
-            fi
-            sleep 1
-          done
+          fail() {
+            echo "$1 (after $SECONDS seconds)"
+            echo "==== PULSAR CONTAINER LOGS ===="
+            docker logs --tail=200 pulsar || true
+            exit 1
+          }
 
-          echo "Health endpoint didn't respond in time:"
-          docker logs --tail=200 pulsar || true
-          exit 1
+          wait_for() {
+            local what="$1"; shift
+            echo "Waiting for ${what}..."
+            while (( SECONDS < deadline )); do
+              if "$@" >/dev/null 2>&1; then
+                echo "${what} ready"
+                return 0
+              fi
+              # A dead container will never become ready; stop early.
+              if [ "$(docker inspect -f '{{.State.Running}}' pulsar 2>/dev/null)" != "true" ]; then
+                fail "container exited while waiting for ${what}"
+              fi
+              sleep 1
+            done
+            fail "timed out waiting for ${what}"
+          }
+
+          port_open() { (echo > /dev/tcp/127.0.0.1/6650); }
+          health_ok() { curl -sf http://127.0.0.1:8080/admin/v2/brokers/health; }
+          # Health can go green before standalone finishes bootstrapping
+          # public/default, which every test needs; waiting only on health makes the
+          # first tests to run racily fail with "Namespace not found".
+          namespace_ok() {
+            curl -sf http://127.0.0.1:8080/admin/v2/namespaces/public | grep -q 'public/default'
+          }
+
+          wait_for "broker port 6650" port_open
+          wait_for "broker health" health_ok
+          wait_for "namespace public/default" namespace_ok
 
       - name: Run tests (serial, verbose)
         env:

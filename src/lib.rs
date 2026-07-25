@@ -20,7 +20,7 @@
 //! ```toml
 //! [dependencies]
 //! env_logger = "0.9"
-//! pulsar = "4.1.1"
+//! pulsar = "7.0.0"
 //! serde = { version = "1.0", features = ["derive"] }
 //! serde_json = "1.0"
 //! tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
@@ -188,7 +188,7 @@ compile_error!("You have selected both features \"async-std-rustls-runtime-aws-l
 #[cfg(feature = "admin-api")]
 pub use admin::AdminClient;
 pub use client::{DeserializeMessage, Pulsar, PulsarBuilder, SerializeMessage};
-pub use connection::Authentication;
+pub use connection::{Authentication, BrokerFeatures};
 pub use connection_manager::{
     BrokerAddress, ConnectionRetryOptions, OperationRetryOptions, TlsOptions,
 };
@@ -212,6 +212,7 @@ pub use message::{
     Payload,
 };
 pub use producer::{MultiTopicProducer, Producer, ProducerOptions};
+pub use routing_policy::{CustomRoutingPolicy, HashingScheme, RoutingPolicy};
 
 #[cfg(feature = "admin-api")]
 pub mod admin;
@@ -794,8 +795,10 @@ mod tests {
     }
 
     async fn is_publishers_empty(topic: &str) -> bool {
-        let stats_url =
-            format!("http://127.0.0.1:8080/admin/v2/persistent/public/default/{topic}/stats");
+        let stats_url = format!(
+            "{}/admin/v2/persistent/public/default/{topic}/stats",
+            test_utils::admin_url()
+        );
         let response = reqwest::get(stats_url).await.unwrap();
         assert!(response.status().is_success());
         let json_value: Value = response.json().await.unwrap();
@@ -815,7 +818,7 @@ mod tests {
         feature = "tokio-rustls-runtime-ring"
     ))]
     async fn admin_sets_max_unacked_messages_per_consumer() {
-        let pulsar = Pulsar::builder("pulsar://127.0.0.1:6650", TokioExecutor)
+        let pulsar = Pulsar::builder(test_utils::broker_url(), TokioExecutor)
             .build()
             .await
             .unwrap();
@@ -825,10 +828,11 @@ mod tests {
         // especially on some Pulsar versions. A 404 response (topic not found)
         // means the service is up; anything else means it is still starting.
         for _ in 0..30 {
-            let status = reqwest::get(
-                "http://127.0.0.1:8080/admin/v2/persistent/public/default\
+            let status = reqwest::get(format!(
+                "{}/admin/v2/persistent/public/default\
                  /readiness-probe/maxUnackedMessagesOnConsumer",
-            )
+                test_utils::admin_url()
+            ))
             .await
             .map(|r| r.status().as_u16())
             .unwrap_or(0);
@@ -853,7 +857,7 @@ mod tests {
             .await
             .unwrap();
 
-        let admin = pulsar.admin("http://127.0.0.1:8080").unwrap();
+        let admin = pulsar.admin(test_utils::admin_url()).unwrap();
         admin
             .set_max_unacked_messages_per_consumer(&topic, 200)
             .await
@@ -866,13 +870,158 @@ mod tests {
 
         // Verify the broker stored it.
         let verify_url = format!(
-            "http://127.0.0.1:8080/admin/v2/persistent/public/default\
-             /{topic_name}/maxUnackedMessagesOnConsumer"
+            "{}/admin/v2/persistent/public/default\
+             /{topic_name}/maxUnackedMessagesOnConsumer",
+            test_utils::admin_url()
         );
         let resp = reqwest::get(&verify_url).await.unwrap();
         assert!(resp.status().is_success());
         let value: u32 = resp.json().await.unwrap();
         assert_eq!(value, 200);
+    }
+
+    /// PIP-344: with auto-creation disabled, a lookup for a topic that does not
+    /// exist must report it as missing *and* must not create it.
+    ///
+    /// This mirrors the Java contract in `LookupService.getPartitionedTopicMetadata`:
+    /// a missing topic raises `NotFoundException` rather than reporting zero
+    /// partitions, because zero is also the legitimate answer for an existing
+    /// non-partitioned topic and the two must stay distinguishable.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn lookup_without_auto_creation_reports_missing_and_does_not_create() {
+        use crate::{error::ServiceDiscoveryError, proto::ServerError};
+
+        let pulsar = test_utils::new_pulsar().await;
+
+        // The CI matrix spans brokers that predate PIP-344; there the call must
+        // refuse rather than silently auto-create, which is asserted below.
+        let supported = pulsar
+            .broker_features()
+            .await
+            .unwrap()
+            .supports_get_partitioned_metadata_without_auto_creation;
+
+        let topic_name = format!("test_no_autocreate_{}", rand::random::<u32>());
+        let topic = format!("persistent://public/default/{topic_name}");
+
+        let result = pulsar
+            .lookup_partitioned_topic_number_with_options(&topic, false)
+            .await;
+
+        match (supported, result) {
+            (true, Err(Error::ServiceDiscovery(ServiceDiscoveryError::Query(err, _)))) => {
+                assert_eq!(
+                    err,
+                    Some(ServerError::TopicNotFound),
+                    "a missing topic must be reported as TopicNotFound"
+                );
+            }
+            (
+                false,
+                Err(Error::ServiceDiscovery(ServiceDiscoveryError::Connection(
+                    crate::error::ConnectionError::NotSupported(_),
+                ))),
+            ) => {
+                // Pre-PIP-344 broker: refusing is correct, since honouring the
+                // request is impossible and auto-creating would be a surprise.
+                // Note the wrapping: `lookup_partitioned_topic` returns a
+                // `ConnectionError`, service discovery wraps it as
+                // `ServiceDiscoveryError::Connection`, and the client wraps that
+                // again as `Error::ServiceDiscovery`.
+            }
+            (supported, other) => {
+                panic!("unexpected result with broker support = {supported}: {other:?}")
+            }
+        }
+
+        // The real point: whichever branch ran, the topic must not now exist.
+        let list_url = format!(
+            "{}/admin/v2/persistent/public/default",
+            test_utils::admin_url()
+        );
+        let existing: Vec<String> = reqwest::get(&list_url).await.unwrap().json().await.unwrap();
+        assert!(
+            !existing.iter().any(|t| t.contains(&topic_name)),
+            "lookup with auto-creation disabled created {topic}"
+        );
+    }
+
+    /// With auto-creation disabled, an *existing* topic must still report its
+    /// real partition count — the flag must not turn every lookup into an error.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn lookup_without_auto_creation_finds_existing_topics() {
+        let pulsar = test_utils::new_pulsar().await;
+        if !pulsar
+            .broker_features()
+            .await
+            .unwrap()
+            .supports_get_partitioned_metadata_without_auto_creation
+        {
+            log::warn!("broker predates PIP-344, skipping");
+            return;
+        }
+
+        // A partitioned topic reports its partition count.
+        let partitioned = format!("test_no_autocreate_part_{}", rand::random::<u32>());
+        test_utils::create_partitioned_topic("public", "default", &partitioned, 3).await;
+        assert_eq!(
+            pulsar
+                .lookup_partitioned_topic_number_with_options(
+                    format!("persistent://public/default/{partitioned}"),
+                    false,
+                )
+                .await
+                .unwrap(),
+            3
+        );
+
+        // A non-partitioned topic reports zero, which is why "missing" cannot
+        // also be represented as zero.
+        let plain = format!("test_no_autocreate_plain_{}", rand::random::<u32>());
+        let plain_topic = format!("persistent://public/default/{plain}");
+        let _producer = pulsar
+            .producer()
+            .with_topic(&plain_topic)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            pulsar
+                .lookup_partitioned_topic_number_with_options(&plain_topic, false)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// The default lookup keeps its historical create-on-lookup behavior, so
+    /// existing callers are unaffected by the option above.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn lookup_by_default_still_auto_creates() {
+        let pulsar = test_utils::new_pulsar().await;
+        let topic_name = format!("test_autocreate_{}", rand::random::<u32>());
+        let topic = format!("persistent://public/default/{topic_name}");
+
+        let partitions = pulsar
+            .lookup_partitioned_topic_number(&topic)
+            .await
+            .unwrap();
+        assert_eq!(partitions, 0, "auto-created topics are non-partitioned");
     }
 
     #[tokio::test]
