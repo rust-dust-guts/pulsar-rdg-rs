@@ -61,7 +61,7 @@ zstd = { version = "^0.13.2", optional = true }
 env_logger = "^0.11.8"
 serde = { version = "^1.0.216", features = ["derive"] }
 serde_json = "^1.0.133"
-tokio = { version = "^1.42.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "^1.42.0", features = ["macros", "rt-multi-thread", "test-util"] }
 assert_matches = "1.5.0"
 reqwest = { version = "0.13", features = ["json"] }
 
@@ -78,16 +78,16 @@ auth-oauth2 = ["openidconnect", "oauth2", "serde", "serde_json", "data-url"]
 compression = ["lz4", "flate2", "zstd", "snap"]
 default = ["compression", "tokio-runtime", "async-std-runtime", "auth-oauth2"]
 protobuf-src = ["dep:protobuf-src"]
-# Deliberately `dep:tokio` rather than the `tokio` feature below: enabling the
-# admin client must not make `cfg(feature = "tokio")` true, because that is what
-# selects the tokio *runtime* code paths. reqwest needs a tokio reactor, so the
-# admin client keeps a small one of its own for callers on another executor.
+# `dep:tokio` + `rt-multi-thread`: reqwest needs a tokio reactor, so the admin
+# client keeps a small one of its own for callers running on another executor.
 admin-api = ["dep:reqwest", "reqwest?/native-tls", "reqwest?/json", "reqwest?/query", "reqwest?/multipart", "serde", "serde_json", "dep:base64", "dep:tokio", "tokio?/rt-multi-thread"]
-# Kept as an explicit feature so `cfg(feature = "tokio")` still resolves; the
-# runtime features below turn it on, `admin-api` does not.
+# Compatibility alias. Before `dep:tokio` appeared in `admin-api` this was
+# Cargo's implicit feature for the optional dependency and downstream manifests
+# could name it; `dep:` suppresses that, so it is declared explicitly. Nothing
+# reads `cfg(feature = "tokio")` any more, so it only links the crate.
 tokio = ["dep:tokio"]
 telemetry = ["tracing"]
-tokio-runtime = ["tokio", "tokio-util", "native-tls", "tokio-native-tls"]
+tokio-runtime = ["dep:tokio", "tokio-util", "native-tls", "tokio-native-tls"]
 tokio-rustls-runtime = ["tokio-rustls-runtime-aws-lc-rs"]
-tokio-rustls-runtime-aws-lc-rs = ["tokio", "tokio-util", "webpki-roots", "rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
-tokio-rustls-runtime-ring = ["tokio", "tokio-util", "webpki-roots", "rustls/ring", "tokio-rustls/ring"]
+tokio-rustls-runtime-aws-lc-rs = ["dep:tokio", "tokio-util", "webpki-roots", "rustls/aws-lc-rs", "tokio-rustls/aws-lc-rs"]
+tokio-rustls-runtime-ring = ["dep:tokio", "tokio-util", "webpki-roots", "rustls/ring", "tokio-rustls/ring"]

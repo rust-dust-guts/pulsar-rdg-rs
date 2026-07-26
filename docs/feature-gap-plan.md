@@ -41,6 +41,7 @@ See [§12](#12-divergence-from-upstream-streamnativepulsar-rs) for the consolida
 | Test infra | CI: a Pulsar proxy in front of the broker, so `proxy-stats` is genuinely exercised | **done** |
 | Test infra | Admin tests under `async-std` (`tests/async_std_admin.rs`, external target), covering the runtime bridge | **done** |
 | Review | `NonZeroUsize` partition count, `make_hash(self)`, hot-path clone removed, version → 7.0.0 | **done** |
+| Review | Consumer timeout moved onto `Executor::delay`; it was `cfg`-selected, and since the default features enable both runtimes it drove a `TokioExecutor` consumer with async-std's timer | **done** |
 | Phase 0 | **D1** `HashingScheme` (Java parity, `JavaStringHash` default) | **done** |
 | Phase 0 | **D2** `RoutingPolicy::Single` and the no-policy default now hash-route keyed messages | **done** |
 | Phase 0 | Golden-vector harness generated from Pulsar's own Java source (`scripts/gen_java_hash_vectors.sh`, 100 vectors) | **done** |
@@ -77,7 +78,7 @@ no longer inherited from the batch envelope), but the **publish** side is not:
 This needs an API change to `producer::Message` plus bidirectional Rust↔Java round-trip tests, so it
 is carried into Phase 1 as its own item rather than left implied.
 
-Test count: **50 → 225** (plus 20 doctests and 3 async-std tests). All green against Pulsar 5.0.0-M1; `cargo fmt --all
+Test count: **50 → 231** (plus 20 doctests and 3 async-std tests). All green against Pulsar 5.0.0-M1; `cargo fmt --all
 --check` and both CI clippy feature sets clean.
 
 ### Correction to §1 (wire protocol)
@@ -94,7 +95,7 @@ the scalable-topic command set (28 messages, 17 command types), deferred to Phas
 
 The Java client's ~2,160 `@Test` methods break down as: `pulsar-client` unit 704, `pulsar-client-v5`
 96, `pulsar-client-admin` 52, `pulsar-client-api-v5` 14, plus the client-facing integration suites
-that live in `pulsar-broker` — `client/api` 801 and `client/impl` 493. Rust is at 225.
+that live in `pulsar-broker` — `client/api` 801 and `client/impl` 493. Rust is at 231.
 
 Closing that as a standalone project would cost more than all the feature phases combined, and a raw
 count is a weak metric anyway (much of the Java total is the same behaviour re-run across broker

@@ -348,3 +348,233 @@ impl Future for Delay {
         }
     }
 }
+
+/// The timer fired before the future completed. Returned by [`timeout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Elapsed;
+
+impl std::fmt::Display for Elapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("operation timed out")
+    }
+}
+
+impl std::error::Error for Elapsed {}
+
+/// Races `future` against `executor`'s timer.
+///
+/// Timing goes through [`Executor::delay`] rather than calling into tokio or
+/// async-std directly, so it needs no `cfg` and always uses the timer belonging to
+/// the executor actually in use.
+///
+/// That last part is the point. This replaces a pair of `cfg`-selected wrappers
+/// around `tokio::time::timeout` and `async_std::future::timeout` — and because the
+/// default features enable *both* runtimes, `cfg(feature = "async-std")` was true in
+/// the default build, so a `TokioExecutor` consumer was driven by async-std's timer.
+pub(crate) async fn timeout<E, F>(
+    executor: &E,
+    future: F,
+    duration: std::time::Duration,
+) -> Result<F::Output, Elapsed>
+where
+    E: Executor,
+    F: Future,
+{
+    use futures::future::{select, Either};
+
+    // Both sides need pinning: a plain `F` is not `Unpin`, and neither is `Delay`
+    // (it wraps tokio's `Sleep`).
+    let future = std::pin::pin!(future);
+    let delay = std::pin::pin!(executor.delay(duration));
+    match select(future, delay).await {
+        Either::Left((output, _)) => Ok(output),
+        Either::Right(((), _)) => Err(Elapsed),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures::{channel::mpsc, future::poll_immediate, SinkExt, StreamExt};
+
+    use super::*;
+
+    /// Deliberately huge. These tests advance tokio's *paused* clock, which costs no
+    /// wall-clock time, and the discriminator between a virtual and a real timer is
+    /// that only the virtual one can be moved. With a one-second tick a CI stall of
+    /// over a second would let a real-time timer expire too, and the test would pass
+    /// with the bug present.
+    const TICK: Duration = Duration::from_secs(3600);
+
+    /// Each executor supplies its own timer.
+    ///
+    /// Asserted on the `Delay` variant directly, because it is the one check that
+    /// cannot pass for the wrong reason and cannot hang.
+    #[tokio::test]
+    async fn each_executor_supplies_its_own_timer() {
+        #[cfg(any(
+            feature = "tokio-runtime",
+            feature = "tokio-rustls-runtime-aws-lc-rs",
+            feature = "tokio-rustls-runtime-ring"
+        ))]
+        assert!(
+            matches!(TokioExecutor.delay(TICK), Delay::Tokio(_)),
+            "the tokio executor handed out a non-tokio timer"
+        );
+
+        #[cfg(any(
+            feature = "async-std-runtime",
+            feature = "async-std-rustls-runtime-aws-lc-rs",
+            feature = "async-std-rustls-runtime-ring"
+        ))]
+        assert!(
+            matches!(AsyncStdExecutor.delay(TICK), Delay::AsyncStd(_)),
+            "the async-std executor handed out a non-async-std timer"
+        );
+    }
+
+    /// `timeout` must expire off the executor's timer and nothing else.
+    ///
+    /// The discriminator is that the timeout becomes ready from *advancing tokio's
+    /// clock alone*, with no real time passing. A naive version of this test awaited
+    /// the timeout after advancing — which any real-time timer eventually satisfies,
+    /// so it passed even when the timer came from async-std. Polling exactly once is
+    /// what distinguishes them.
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    #[tokio::test(start_paused = true)]
+    async fn timeout_expires_from_the_executors_clock_alone() {
+        let mut timeout = Box::pin(timeout(
+            &TokioExecutor,
+            futures::future::pending::<()>(),
+            TICK,
+        ));
+
+        assert!(
+            poll_immediate(&mut timeout).await.is_none(),
+            "the timeout was ready before its duration elapsed"
+        );
+
+        tokio::time::advance(TICK * 2).await;
+        assert_eq!(
+            poll_immediate(&mut timeout).await,
+            Some(Err(Elapsed)),
+            "advancing tokio's clock did not make the timeout ready, so it is \
+             waiting on some other timer"
+        );
+    }
+
+    /// A future that is already ready wins, even against a zero-length timeout.
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    #[tokio::test]
+    async fn a_ready_future_beats_an_expired_timer() {
+        assert_eq!(
+            timeout(&TokioExecutor, async { 7 }, Duration::ZERO).await,
+            Ok(7),
+            "a ready future must not lose to a zero-length timeout"
+        );
+    }
+
+    /// Timing out must not consume anything from the stream.
+    ///
+    /// The consumer loop calls this on `event_rx.next()` once a second forever, so a
+    /// timeout that swallowed a queued item would silently drop messages.
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    #[tokio::test(start_paused = true)]
+    async fn timing_out_a_stream_read_loses_no_items() {
+        let (mut tx, mut rx) = mpsc::unbounded::<u8>();
+
+        let mut attempt = Box::pin(timeout(&TokioExecutor, rx.next(), TICK));
+        assert!(poll_immediate(&mut attempt).await.is_none());
+        tokio::time::advance(TICK * 2).await;
+        assert_eq!(poll_immediate(&mut attempt).await, Some(Err(Elapsed)));
+        drop(attempt);
+
+        // The item arrives only after the timeout, and must still be delivered.
+        tx.send(42).await.unwrap();
+        assert_eq!(
+            timeout(&TokioExecutor, rx.next(), TICK).await,
+            Ok(Some(42)),
+            "an item sent after a timeout was lost"
+        );
+    }
+
+    /// Runs `fut` with an independent watchdog, so a helper that never wakes fails
+    /// in a second instead of hanging until the CI job times out.
+    ///
+    /// The watchdog is async-std's own `timeout`, not the helper under test, so a
+    /// broken helper cannot mask its own failure.
+    #[cfg(any(
+        feature = "async-std-runtime",
+        feature = "async-std-rustls-runtime-aws-lc-rs",
+        feature = "async-std-rustls-runtime-ring"
+    ))]
+    async fn within_a_second<F: Future>(what: &str, fut: F) -> F::Output {
+        match async_std::future::timeout(Duration::from_secs(1), fut).await {
+            Ok(output) => output,
+            Err(_) => panic!("{what}: the helper never completed — its timer never woke"),
+        }
+    }
+
+    /// The async-std path must expire on its own timer, with no tokio runtime.
+    ///
+    /// Runs under `#[async_std::test]`, so nothing has entered a tokio runtime. That
+    /// matters: a hard-coded `tokio::time` call panics with "there is no reactor
+    /// running" rather than hanging, so this fails loudly. An earlier round replaced
+    /// this test with a `Delay`-variant assertion out of a misplaced worry about
+    /// hangs — but the variant check only proves what `delay()` returns, not that
+    /// `timeout` expires off it.
+    #[cfg(any(
+        feature = "async-std-runtime",
+        feature = "async-std-rustls-runtime-aws-lc-rs",
+        feature = "async-std-rustls-runtime-ring"
+    ))]
+    #[async_std::test]
+    async fn async_std_timeout_expires_without_a_tokio_runtime() {
+        // Real time here, unlike the paused-clock tests, so keep it short.
+        let outcome = within_a_second(
+            "async_std_timeout_expires_without_a_tokio_runtime",
+            timeout(
+                &AsyncStdExecutor,
+                futures::future::pending::<()>(),
+                Duration::from_millis(50),
+            ),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            Err(Elapsed),
+            "the async-std executor's timeout did not expire on its own timer"
+        );
+    }
+
+    /// And a future that completes still wins under async-std.
+    #[cfg(any(
+        feature = "async-std-runtime",
+        feature = "async-std-rustls-runtime-aws-lc-rs",
+        feature = "async-std-rustls-runtime-ring"
+    ))]
+    #[async_std::test]
+    async fn async_std_timeout_returns_the_future_output() {
+        // TICK is an hour, so without the watchdog a helper that failed to notice
+        // the future completing would stall the job rather than fail.
+        let outcome = within_a_second(
+            "async_std_timeout_returns_the_future_output",
+            timeout(&AsyncStdExecutor, async { 7 }, TICK),
+        )
+        .await;
+        assert_eq!(outcome, Ok(7), "a ready future lost to an hour-long timer");
+    }
+}

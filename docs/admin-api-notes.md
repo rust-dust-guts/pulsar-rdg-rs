@@ -1,6 +1,6 @@
 # Admin API — implementation notes
 
-**225 lib tests + 20 doctests green**, plus 3 async-std tests in an
+**231 lib tests + 20 doctests green**, plus 3 async-std tests in an
 external target against Pulsar 5.0.0-M1;
 `cargo fmt --all --check` and both CI clippy feature sets clean.
 
