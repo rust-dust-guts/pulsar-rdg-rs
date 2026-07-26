@@ -40,6 +40,8 @@ prost = "^0.13.4"
 prost-derive = "^0.13.4"
 rand = "^0.8.5"
 reqwest = { version = "0.13", optional = true, default-features = false }
+# Function state carries `byte[]`, which Jackson renders as a base64 string.
+base64 = { version = "0.22", optional = true }
 regex = "^1.11.1"
 rustls = { version = "^0.23.27", default-features = false, features = ["log", "std"] , optional = true }
 snap = { version = "^1.1.1", optional = true }
@@ -76,7 +78,14 @@ auth-oauth2 = ["openidconnect", "oauth2", "serde", "serde_json", "data-url"]
 compression = ["lz4", "flate2", "zstd", "snap"]
 default = ["compression", "tokio-runtime", "async-std-runtime", "auth-oauth2"]
 protobuf-src = ["dep:protobuf-src"]
-admin-api = ["dep:reqwest", "reqwest?/native-tls", "serde", "serde_json"]
+# Deliberately `dep:tokio` rather than the `tokio` feature below: enabling the
+# admin client must not make `cfg(feature = "tokio")` true, because that is what
+# selects the tokio *runtime* code paths. reqwest needs a tokio reactor, so the
+# admin client keeps a small one of its own for callers on another executor.
+admin-api = ["dep:reqwest", "reqwest?/native-tls", "reqwest?/json", "reqwest?/query", "reqwest?/multipart", "serde", "serde_json", "dep:base64", "dep:tokio", "tokio?/rt-multi-thread"]
+# Kept as an explicit feature so `cfg(feature = "tokio")` still resolves; the
+# runtime features below turn it on, `admin-api` does not.
+tokio = ["dep:tokio"]
 telemetry = ["tracing"]
 tokio-runtime = ["tokio", "tokio-util", "native-tls", "tokio-native-tls"]
 tokio-rustls-runtime = ["tokio-rustls-runtime-aws-lc-rs"]

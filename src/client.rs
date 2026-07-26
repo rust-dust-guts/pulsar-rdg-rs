@@ -483,7 +483,9 @@ impl<Exe: Executor> Pulsar<Exe> {
     ///
     /// The admin client reuses the TLS and authentication configuration
     /// already present on this `Pulsar` instance. Requires one of the
-    /// `admin-api` feature flags and a tokio runtime.
+    /// `admin-api` feature flag. Works under any executor: requests run on the
+    /// ambient Tokio runtime when there is one, and on a small runtime the client
+    /// owns otherwise, so `async-std` callers are supported.
     ///
     /// # Arguments
     ///
@@ -496,7 +498,7 @@ impl<Exe: Executor> Pulsar<Exe> {
     /// # async fn run(pulsar: pulsar::Pulsar<pulsar::TokioExecutor>) -> Result<(), pulsar::Error> {
     /// let admin = pulsar.admin("http://pulsar-proxy")?;
     /// admin
-    ///     .set_max_unacked_messages_per_consumer(
+    ///     .set_max_unacked_messages_on_consumer(
     ///         "persistent://public/default/my-topic",
     ///         500,
     ///     )
@@ -525,12 +527,28 @@ impl<Exe: Executor> Pulsar<Exe> {
         Ok(connection.sender().broker_features())
     }
 
+    /// An admin client for `admin_url`, reusing this client's TLS and auth.
     #[cfg(feature = "admin-api")]
     pub fn admin(&self, admin_url: impl Into<String>) -> Result<crate::AdminClient, Error> {
         crate::admin::AdminClient::new(
             admin_url.into(),
             &self.manager.tls_options,
             self.manager.auth.clone(),
+        )
+    }
+
+    /// [`admin`][Self::admin] with a non-default request timeout.
+    #[cfg(feature = "admin-api")]
+    pub fn admin_with_options(
+        &self,
+        admin_url: impl Into<String>,
+        options: &crate::admin::AdminOptions,
+    ) -> Result<crate::AdminClient, Error> {
+        crate::admin::AdminClient::with_options(
+            admin_url.into(),
+            &self.manager.tls_options,
+            self.manager.auth.clone(),
+            options,
         )
     }
 }

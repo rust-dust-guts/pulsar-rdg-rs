@@ -35,9 +35,11 @@ See [§12](#12-divergence-from-upstream-streamnativepulsar-rs) for the consolida
 
 | Phase | Item | Status |
 |---|---|---|
-| Test infra | Configurable broker endpoints (`PULSAR_BROKER_URL` / `PULSAR_ADMIN_URL`), `scripts/start_test_broker.sh` | **done** |
+| Test infra | Configurable endpoints (`PULSAR_BROKER_URL` / `PULSAR_ADMIN_URL` / `PULSAR_PROXY_URL` / `PULSAR_PROXY_ADMIN_URL`), `scripts/start_test_broker.sh` | **done** |
 | Test infra | CI matrix extended to Pulsar `5.0.0-M1` | **done** |
 | Test infra | CI: `PULSAR_PREFIX_*` overrides now actually applied (+ guard step, namespace readiness wait) | **done** |
+| Test infra | CI: a Pulsar proxy in front of the broker, so `proxy-stats` is genuinely exercised | **done** |
+| Test infra | Admin tests under `async-std` (`tests/async_std_admin.rs`, external target), covering the runtime bridge | **done** |
 | Review | `NonZeroUsize` partition count, `make_hash(self)`, hot-path clone removed, version → 7.0.0 | **done** |
 | Phase 0 | **D1** `HashingScheme` (Java parity, `JavaStringHash` default) | **done** |
 | Phase 0 | **D2** `RoutingPolicy::Single` and the no-policy default now hash-route keyed messages | **done** |
@@ -50,6 +52,15 @@ See [§12](#12-divergence-from-upstream-streamnativepulsar-rs) for the consolida
 | Phase 0 | **Publishing** a protocol null value or a binary key | **not done** — see below |
 | **Phase 0** | **substantially complete**, one item outstanding | ⚠️ |
 | Phase 1 | null-value + binary-key publish/consume API, `autoUpdatePartitions`, TLS client auth, `listenerName`, reader primitives, ack grouping, … | next |
+| Phase 3 | Admin foundation: typed `AdminError` taxonomy, request plumbing, verified models | **done** |
+| Phase 3 | Admin groups: clusters, tenants, namespaces, brokers, bookies, resource groups, resource quotas (~125 ops) | **done** |
+| Phase 3 | Admin group: topic policies (88 ops, every policy typed, local and global sets) | **done** |
+| Phase 3 | Fully typed `Policies` (52 fields) and `OffloadPolicies` (31 fields) — no raw JSON in the admin surface | **done** |
+| Phase 3 | Admin group: topics (56 ops — data plane, stats, cursors, peek/examine, message addressing) | **done** |
+| Phase 3 | Admin groups: schemas, non-persistent topics, broker stats, lookup, transactions | **done** |
+| Phase 3 | Admin group: scalable topics + segments (25 ops, Pulsar 5.0 `topic://`) | **done** |
+| Phase 3 | Multipart upload layer + functions, sinks, sources, packages, worker, proxy stats, metadata migration | **done** |
+| **Phase 3** | **Admin API: 498 ops across all 21 interfaces, every group tested; 5 individual ops outstanding** | 🟡 |
 
 **Correction to an earlier completion claim.** Phase 0 originally listed
 "`null_value` / `null_partition_key` / `partition_key_b64_encoded` proto fields **+ handling**", and
@@ -66,7 +77,7 @@ no longer inherited from the batch envelope), but the **publish** side is not:
 This needs an API change to `producer::Message` plus bidirectional Rust↔Java round-trip tests, so it
 is carried into Phase 1 as its own item rather than left implied.
 
-Test count: **50 → 73** (plus 20 doctests). All green against Pulsar 5.0.0-M1; `cargo fmt --all
+Test count: **50 → 225** (plus 20 doctests and 3 async-std tests). All green against Pulsar 5.0.0-M1; `cargo fmt --all
 --check` and both CI clippy feature sets clean.
 
 ### Correction to §1 (wire protocol)
@@ -77,13 +88,13 @@ identical fields diffed as missing. Re-run with whitespace stripped entirely,
 `MessageMetadata.partition_key_b64_encoded`, `SingleMessageMetadata.{null_value,
 null_partition_key, partition_key_b64_encoded}` and `CommandSend.is_chunk` were **already
 present**. The genuine field-level gaps were the ones now closed; the real remaining gap is
-the scalable-topic command set (29 messages, 18 command types), deferred to Phase 5.
+the scalable-topic command set (28 messages, 17 command types), deferred to Phase 5.
 
 ### Test parity target
 
 The Java client's ~2,160 `@Test` methods break down as: `pulsar-client` unit 704, `pulsar-client-v5`
 96, `pulsar-client-admin` 52, `pulsar-client-api-v5` 14, plus the client-facing integration suites
-that live in `pulsar-broker` — `client/api` 801 and `client/impl` 493. Rust is at 73.
+that live in `pulsar-broker` — `client/api` 801 and `client/impl` 493. Rust is at 225.
 
 Closing that as a standalone project would cost more than all the feature phases combined, and a raw
 count is a weak metric anyway (much of the Java total is the same behaviour re-run across broker
@@ -236,7 +247,7 @@ than individual fields.
 | DLQ policy completeness | ✅ | 🟡 | 🟡 | **P1** — has `max_redeliver_count` + `dead_letter_topic`; missing `retryLetterTopic`, `initialSubscriptionName`, producer customizer |
 | `KeySharedPolicy` (AUTO_SPLIT / STICKY ranges, `allowOutOfOrderDelivery`) | ✅ | ❌ | ❌ | **P1** — `Key_Shared` subtype works but no `KeySharedMeta` is sent, so sticky ranges are impossible |
 | `negativeAckRedeliveryDelay` / backoff / precision | ✅ | ❌ | ❌ | **P1** — `nack` exists but redelivery timing is not configurable |
-| `hasReachedEndOfTopic` | ✅ | 🟡 | 🟡 | **P1** — engine consumes the command internally ([`consumer/engine.rs:364`](../src/consumer/engine.rs:364)) but exposes no API |
+| `hasReachedEndOfTopic` | ✅ | 🟡 | 🟡 | **P1** — engine consumes the command internally ([`consumer/engine.rs:364`](../src/consumer/engine.rs#L364)) but exposes no API |
 | `replicateSubscriptionState` | ✅ | ❌ | ❌ | **P1** — geo-replicated subscriptions |
 | `pause()` / `resume()` | ✅ | ❌ | ❌ | P2 |
 | `batchReceive` + `BatchReceivePolicy` | ✅ | ❌ | ❌ | P2 |
@@ -327,45 +338,108 @@ The Rust client has no schema *layer* — only a raw `proto::Schema` you fill in
 
 ## 8. Admin API
 
-This is the largest gap by raw surface area. Java exposes ~550 unique operations across 21
-interfaces (~1,400 methods counting `*Async` variants). The Rust `AdminClient`
-([`src/admin.rs`](../src/admin.rs), 519 lines including tests) exposes 3.
+Java exposes ~550 unique operations across 21 interfaces (~1,400 methods counting `*Async`
+variants). Operations are grouped behind accessors — `admin.namespaces()`, `admin.topics()`,
+`admin.functions()` — mirroring the Java client's separate interfaces, because `Namespaces` and
+`TopicPolicies` share ~30 operation names and cannot both sit flat on one type.
 
-| Java interface | Unique ops | Rust RDG | Coverage |
-|---|:--:|:--:|:--:|
-| `Namespaces` | 156 | 0 | 0% |
-| `Topics` | 133 | 1 (`maxUnackedMessagesOnConsumer` set/remove) | <1% |
-| `TopicPolicies` (v2 policy path) | 88 | 0 | 0% |
-| **`ScalableTopics`** (new in 5.0) | 24 | 0 | 0% |
-| `Clusters` | 21 | 0 | 0% |
-| `Transactions` | 16 | 0 | 0% |
-| `Brokers` | 13 | 0 | 0% |
-| `Schemas` | 8 | 2 (`get`, `get at version`) | 25% |
-| `NonPersistentTopics` | 7 | 0 | 0% |
-| `Packages` | 7 | 0 | 0% |
-| `BrokerStats` | 6 | 0 | 0% |
-| `Tenants` | 5 | 0 | 0% |
-| `Bookies` | 5 | 0 | 0% |
-| `ResourceGroups` | 5 | 0 | 0% |
-| `ResourceQuotas` | 5 | 0 | 0% |
-| `Lookup` | 3 | 0 | 0% (binary-protocol lookup exists separately) |
-| `Functions` / `Sources` / `Sinks` / `Worker` | ~74 | 0 | 0% |
-| `ProxyStats` / `MetadataMigration` | 3 | 0 | 0% |
+**A number difference in this table is not a missing feature.** The counts measure
+Java *method names* against Rust *methods*, and those units do not line up:
 
-Also missing, and needed before bulk endpoint work is worth doing:
+* Rust has no overloading, so one Java name with several signatures becomes several
+  Rust methods (`Sinks`, `Sources`, `Functions`, `Brokers` are all higher here).
+* Java sometimes has two names over one REST endpoint, which this client implements
+  once (`Clusters`).
+* Java's `Topics` interface **duplicates 72 topic-policy names it has already
+  deprecated** in favour of `TopicPolicies`. Both spellings issue the identical
+  request — `TopicsImpl::getRetentionAsync` and `TopicPoliciesImpl::getRetentionAsync`
+  both build `topicPath(tn, "retention") + ?applied=` — and `Topics.java` carries 180
+  `@Deprecated` markers while `TopicPolicies.java` carries none. This client
+  implements each of those operations once, in `topic_policies`. So the `Topics` row
+  reading 61 against 56 is the honest comparison; the raw interface figure of 133
+  counts the deprecated aliases a second time.
 
-- **Typed policy models.** Java's `pulsar-common` carries ~200 `policies/data` classes
-  (`RetentionPolicies`, `BacklogQuota`, `DispatchRate`, `PersistencePolicies`, `TopicStats`,
-  `PartitionedTopicStats`, `OffloadPolicies`, `InactiveTopicPolicies`, …). Every admin op takes or
-  returns one. Rust has none.
-- **Error taxonomy.** `AdminError` ([`src/error.rs:509`](../src/error.rs:509)) collapses everything to
-  `Http { status, body }`. Java distinguishes `NotFoundException`, `ConflictException`,
-  `NotAuthorizedException`, `PreconditionFailedException`, `NotAllowedException`, … Callers
-  currently have to string-match HTTP bodies.
-- **No retry / timeout policy.** Fixed 30 s `reqwest` timeout, no retry, no `PulsarAdminBuilder`
-  equivalent. TLS + auth reuse from the `Pulsar` client is already done correctly.
-- **No async-std support.** `admin-api` hard-requires `reqwest` + tokio, so the `async-std-runtime`
-  feature cannot use the admin client at all.
+Where an operation really is absent it is called out in the Notes column and listed
+in [Known gaps](admin-api-notes.md#known-gaps). Row-by-row arithmetic is in
+[the accounting](#why-the-two-columns-differ) below the table.
+
+| Group | Java | pulsar-rs | Rust RDG | Prio | Notes |
+|---|:--:|:--:|:--:|:--:|---|
+| `Namespaces` | ✅ 156 | ❌ | ✅ 156 | **P1** | All policies typed; every get/set/remove round-tripped |
+| `TopicPolicies` | ✅ 88 | ❌ | ✅ 88 | **P1** | Every policy, plus namespace-override precedence and the global (geo-replicated) policy set |
+| `Topics` | ✅ 61 ᵃ | 🟡 1 | ✅ 56 | **P1** | Data plane only. 4 absent: topic-level `schemaValidationEnforced` get/set, `createShadowTopic`, `getShadowSource` |
+| `ScalableTopics` + `Segments` | ✅ 24 | ❌ | ✅ 25 | **P2** | Pulsar 5.0 `topic://`; split/merge verified against 5.0.0-M1 |
+| `Clusters` | ✅ 21 | ❌ | ✅ 19 | **P2** | Java's `create*`/`update*` failure-domain and isolation-policy pairs each delegate to one `set*` |
+| `Functions` | ✅ 22 | ❌ | ✅ 26 | P3 | Instance-scoped overloads split into named methods; Java's deprecated `getSinks`/`getSources` omitted |
+| `Sinks` | ✅ 13 | ❌ | ✅ 17 | P3 | Four instance-scoped overloads split into named methods |
+| `Sources` | ✅ 13 | ❌ | ✅ 17 | P3 | As `Sinks` |
+| `Transactions` | ✅ 16 | ❌ | ✅ 16 | P2 | Observability plus abort; opening transactions is a client-protocol gap |
+| `Brokers` | ✅ 13 | ❌ | ✅ 15 | **P1** | `getActiveBrokers` and `healthcheck` overloads split in two |
+| `Schemas` | ✅ 8 | 🟡 2 | ✅ 8 | P2 | Register, read by version, list, metadata, delete, compatibility |
+| `Packages` | ✅ 7 | ❌ | ✅ 7 | P3 | Upload/download round-trips bytes exactly; typed `PackageName` parser |
+| `NonPersistentTopics` | ✅ 7 | ❌ | ✅ 7 | P2 | Own stats shape — no storage or cursor fields |
+| `BrokerStats` | ✅ 6 | ❌ | ✅ 6 | P3 | Diagnostic dumps as text, as in Java; load report typed |
+| `Worker` / `WorkerStats` | ✅ 6 | ❌ | ✅ 6 | P3 | Cluster, leader, typed assignments and metrics, rebalance |
+| `Tenants` | ✅ 5 | ❌ | ✅ 5 | **P1** | |
+| `Bookies` | ✅ 5 | ❌ | ✅ 5 | P3 | Rack placement |
+| `ResourceGroups` | ✅ 5 | ❌ | ✅ 5 | P2 | |
+| `ResourceQuotas` | ✅ 5 | ❌ | ✅ 5 | P3 | Default and per-bundle |
+| `Lookup` | ✅ 3 | ❌ | ✅ 3 | P3 | Topic, bundle range, per-partition |
+| `ProxyStats` | ✅ 2 | ❌ | ✅ 4 | P3 | Adds the log-level endpoints Java's interface omits |
+| `MetadataMigration` | ✅ 2 | ❌ | ✅ 2 | P3 | ZooKeeper → Oxia migration control; typed `MigrationPhase` |
+
+ᵃ Java's `Topics` interface declares **133** names, but 72 of them are `@Deprecated`
+aliases of `TopicPolicies` methods over the same REST endpoints, counted in the
+`TopicPolicies` row instead. 61 is the data-plane-only figure, which is what `topics`
+is comparable to.
+
+#### Why the two columns differ
+
+| Row | Δ | Cause |
+|---|:--:|---|
+| `Topics` | −5 | Against Java's 61 data-plane names (see footnote ᵃ), `topics` has 56: 3 are `@Deprecated` deduplication aliases covered by `topic_policies().get_deduplication_status`, and 4 are genuinely absent — topic-level `schemaValidationEnforced` get/set, `createShadowTopic`, `getShadowSource`. Rust also adds 2 overload splits (`get_non_persistent_list`, `reset_cursor_to_message_id`), so 61 − 3 − 4 + 2 = 56 |
+| `Clusters` | −2 | `createFailureDomain`/`updateFailureDomain` and `createNamespaceIsolationPolicy`/`updateNamespaceIsolationPolicy` are four Java names over two REST operations |
+| `Sinks`, `Sources` | +4 | `getSinkStatus`, `stopSink`, `startSink`, `restartSink` each have an instance-scoped overload; Rust names them separately |
+| `Functions` | +4 | Six instance-scoped overload splits, less the two deprecated connector-inventory filters |
+| `Brokers` | +2 | `getActiveBrokers` and `healthcheck` each split into a cluster/broker-scoped pair |
+| `ScalableTopics` | +1 | `createScalableTopic`'s properties overload is a separate method |
+| `ProxyStats` | +2 | `GET`/`POST /proxy-stats/logging` exist in the REST API but not in Java's interface |
+| `Namespaces` | 0 | Nets to zero by coincidence: `createNamespace`'s bundle overload adds one, `getReplicationConfigVersion` is deliberately absent (see below). Sixteen further names differ only by spelling |
+
+**498 operations across all 21 Java admin interfaces**, up from 3 in upstream, with 125 broker-backed
+admin tests against Pulsar 5.0.0-M1 plus 31 unit tests pinning wire formats. **Five Java operations
+remain unimplemented** — one deliberately, four not yet — and test strength varies per operation;
+[Known gaps](admin-api-notes.md#known-gaps) sets out both.
+
+Foundation, all ★ (absent upstream):
+
+| ★ | Item |
+|---|---|
+| Typed error taxonomy | `AdminError` maps HTTP status onto `NotFound` / `Conflict` / `BadRequest` / `NotAuthorized` / `PreconditionFailed` / `NotAllowed` / `NotSupported` / `ServerUnavailable`, extracting the broker's `{"reason": …}`; plus `is_retriable()`. Upstream collapses everything to `Http { status, body }` |
+| Typed models | 81 structs/enums in `admin::models`, every shape verified against a live broker — including `Policies` (52 fields) and `OffloadPolicies` (31). **No `serde_json::Value` in any request body or policy type** |
+| Request layer | `send_empty` / `send_json` / `send_json_opt` / `send_text` / `send_bytes` / `send_message` / `send_multipart`, with per-segment percent-encoding that escapes `/` so a name cannot inject path segments |
+| Multipart uploads | Function, connector and package upload, with JSON, text and file form parts |
+| Retry policy | Deliberately none, matching Java: `BaseResource.sync()` has no retry layer, so errors propagate |
+
+Foundation, now complete:
+
+- **Runtime-agnostic.** `reqwest` needs a tokio reactor, so admin calls from an `async-std` task used
+  to panic with "there is no reactor running". Requests now run on the ambient tokio runtime when
+  there is one and on a small shared runtime of the client's own otherwise, so `async-std-runtime`
+  works. Covered by `src/admin/async_std_tests.rs`, which only builds under that feature.
+- **Configurable timeout.** `Pulsar::admin_with_options(url, &AdminOptions { timeout })`; `admin()`
+  keeps the 30 s default.
+
+The four responses Java types but this client used to return raw — `worker().get_assignments()`,
+`worker().get_metrics()`, `broker_stats().get_load_report()` and
+`transactions().get_position_stats_in_pending_ack()` — are now modelled and tested. What remains
+untyped is genuinely free-form: the `broker-stats` diagnostic dumps and per-instance connector
+status, listed in [Still untyped](admin-api-notes.md#still-untyped). Every policy type is a real
+struct; the function, sink and source request configs carry `serde_json::Value` only for arbitrary
+user data (`userConfig`, `secrets`, `configs`).
+
+See [admin-api-notes.md](admin-api-notes.md) for the wire-format traps found while building this —
+several would have shipped silently-broken code.
 
 ---
 
@@ -598,7 +672,8 @@ entry_hash_max}`, `KeySharedMeta.entryBucketDispatch`,
 | Added here | Detail |
 |---|---|
 | Broker endpoints via `PULSAR_BROKER_URL` / `PULSAR_ADMIN_URL` | upstream hardcodes `127.0.0.1:6650` / `:8080` in every test, so the suite cannot run beside an existing broker |
-| `scripts/start_test_broker.sh` | throwaway broker on random free ports |
+| `scripts/start_test_broker.sh` | throwaway broker **and proxy** on random free ports |
+| CI: a Pulsar proxy in the topology | `proxy-stats` is served by a proxy, not a broker; without one those endpoints can only be asserted to 404 |
 | `scripts/gen_java_hash_vectors.sh` + `src/routing_policy_java_vectors.rs` | 100 golden vectors generated from Pulsar's own Java source; reproducible byte-for-byte |
 | CI matrix entry `5.0.0-M1` | upstream tops out at 4.1.2 |
 | CI: run `apply-config-from-env.py` | upstream's `PULSAR_PREFIX_*` env vars are **silently ignored** — verified inside the container. It works only because the defaults coincide with the port mapping and Linux runners can route to container IPs |
@@ -654,8 +729,8 @@ added as an explicitly deprecated option.
 | Schema | Full typed layer + AVRO/KeyValue/AUTO | Raw proto only | Wrong decode on evolved topics |
 | Auth | 8 providers | 4 | mTLS clusters unreachable |
 | Client | 60 builder options | ~10 | No listener name → unusable on k8s multi-network |
-| Admin | ~550 ops, 21 interfaces | 3 ops | Effectively no admin capability |
-| Scalable topics (5.0) | 13 subsystems, 24 admin ops | 0 | No `topic://` support |
+| Admin | ~550 ops, 21 interfaces | 🟡 498 ops, all 21 interfaces | Five individual ops outstanding; test strength varies per operation |
+| Scalable topics (5.0) | 13 subsystems, 24 admin ops | admin ✅ 21 ops; client protocol ❌ | Admin can manage `topic://`, but nothing can produce to or consume from it |
 
 **Recommended immediate action:** build the parity harness, then run Phase 0. Phase 0 is roughly a
 week of work and removes three classes of silent data incorrectness — it is worth more than any

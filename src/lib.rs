@@ -186,7 +186,7 @@ compile_error!("You have selected both features \"async-std-rustls-runtime-ring\
 compile_error!("You have selected both features \"async-std-rustls-runtime-aws-lc-rs\" and \"async-std-rustls-runtime-ring\" which are exclusive, please choose one of them");
 
 #[cfg(feature = "admin-api")]
-pub use admin::AdminClient;
+pub use admin::{AdminClient, AdminOptions};
 pub use client::{DeserializeMessage, Pulsar, PulsarBuilder, SerializeMessage};
 pub use connection::{Authentication, BrokerFeatures};
 pub use connection_manager::{
@@ -859,7 +859,7 @@ mod tests {
 
         let admin = pulsar.admin(test_utils::admin_url()).unwrap();
         admin
-            .set_max_unacked_messages_per_consumer(&topic, 200)
+            .set_max_unacked_messages_on_consumer(&topic, 200)
             .await
             .unwrap();
 

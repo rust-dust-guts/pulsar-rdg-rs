@@ -49,7 +49,14 @@ Added in this fork:
   capabilities back via `Pulsar::broker_features()`;
 - **PIP-344 partition metadata lookup without topic auto-creation**;
 - **Chunked messages detected and rejected** rather than delivered as truncated payloads;
-- Wire protocol brought to field-level parity with Pulsar 5.0 for all non-scalable-topic messages.
+- Wire protocol brought to field-level parity with Pulsar 5.0 for all non-scalable-topic messages;
+- **A near-complete Admin API** — 498 operations across all 21 of the Java client's admin interfaces,
+  up from 3 upstream, grouped behind accessors (`admin.namespaces()`, `admin.topics()`, …) with
+  typed request and response models rather than raw JSON. Enable the `admin-api` feature. Works
+  under both executors: requests run on the ambient Tokio runtime when there is one, and on a
+  small runtime the client owns otherwise, so async-std callers are supported too;
+- **Scalable topics (PIP-460)** — `topic://` names, the segment DAG, split and merge, and the
+  segment-scoped subscription operations, against Pulsar 5.0.0-M1.
 
 See [docs/feature-gap-plan.md](docs/feature-gap-plan.md) for the full Java-vs-Rust feature matrix,
 what this fork changed, and the roadmap.
@@ -73,14 +80,17 @@ Try out [examples](examples):
 ## Running the tests
 
 The integration tests need a live broker. `scripts/start_test_broker.sh` starts a throwaway Pulsar
-standalone on random free ports and prints the environment the suite reads:
+standalone — plus a proxy in front of it, for the `proxy-stats` tests — on random free ports, and
+prints the environment the suite reads:
 
 ```bash
 broker_env=$(./scripts/start_test_broker.sh) && eval "$broker_env" && cargo test --features admin-api
 ```
 
-Clean up with `docker rm -f pulsar-rs-test`. Both `PULSAR_BROKER_URL` and `PULSAR_ADMIN_URL` can also
-be set by hand to point at an existing broker.
+Clean up with `docker rm -f pulsar-rs-test pulsar-rs-test-proxy`. Set `SKIP_PROXY=1` to start the
+broker alone; the `proxy-stats` tests then skip. All four of `PULSAR_BROKER_URL`, `PULSAR_ADMIN_URL`,
+`PULSAR_PROXY_URL` and `PULSAR_PROXY_ADMIN_URL` can also be set by hand to point at existing
+services.
 
 ## Upgrading from upstream `pulsar-rs` 6.x
 
@@ -90,6 +100,29 @@ ordering is not preserved across a mixed-version fleet.
 
 Upgrade all producers for a given topic together, or drain the topic before switching. See
 [the migration note](docs/feature-gap-plan.md#migrating-partition-routing-from-6x) for details.
+
+### Admin API source breaks
+
+`AdminClient`'s flat methods moved onto groups (`admin.namespaces()`, `admin.topics()`, …) because
+`Namespaces` and `TopicPolicies` define ~30 identically named operations that cannot coexist on one
+type. Beyond that regrouping, these signatures changed in ways the compiler will point at:
+
+| Was | Now | Why |
+|---|---|---|
+| `set_max_unacked_messages_per_consumer` | `topic_policies().set_max_unacked_messages_on_consumer` | matches the `on_consumer` / `on_subscription` pair |
+| `remove_max_unacked_messages_per_consumer` | `topic_policies().remove_max_unacked_messages_on_consumer` | as above |
+| `topics().create_subscription(topic, sub)` | `create_subscription(topic, sub, &MessageIdData::latest())` | it always sent `-1:-1`, which Pulsar defines as *earliest*, while documenting *latest* |
+| `set_dispatcher_pause_on_ack_state_persistent(ns, bool)` | `set_dispatcher_pause_on_ack_state_persistent(ns)` | the broker ignores the body; POST enables and DELETE clears, so `false` read back as `true` |
+| `set_namespace_replication_clusters(ns, clusters)` | `set_namespace_replication_clusters(ns, clusters, compare_topic_partitions)` | exposes Java's partition-compatibility guard |
+| `update_function` / `update_sink` / `update_source` and their `_with_url` forms | same, plus a trailing `options: Option<&UpdateOptions>` | carries Java's `updateOptions` part, whose `updateAuthData` flag refreshes stored credentials; pass `None` for the old behaviour |
+
+The request timeout is now configurable: `pulsar.admin_with_options(url, &AdminOptions { timeout })`.
+`admin(url)` keeps the previous fixed 30-second timeout.
+
+Policy getters no longer turn HTTP 404 into `Ok(None)`. An unset policy is reported by the broker as
+200 with an empty body and still reads as `None`; a 404 now surfaces as `AdminError::NotFound`, so a
+lookup against a namespace or topic that does not exist is no longer indistinguishable from one with
+no override.
 
 ## Contribution
 

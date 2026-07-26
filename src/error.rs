@@ -509,8 +509,29 @@ impl std::error::Error for AuthenticationError {}
 pub enum AdminError {
     /// The HTTP request to the Pulsar admin API failed
     Request(reqwest::Error),
-    /// The Pulsar admin API returned a non-2xx HTTP status
+    /// The requested tenant, namespace, topic, cluster or policy does not exist
+    /// (HTTP 404).
+    NotFound(String),
+    /// The resource already exists, or is in a state that conflicts with the
+    /// request (HTTP 409).
+    Conflict(String),
+    /// The request was rejected as malformed or semantically invalid
+    /// (HTTP 400/422).
+    BadRequest(String),
+    /// Authentication failed or the role lacks permission (HTTP 401/403).
+    NotAuthorized(String),
+    /// A precondition on the request was not met (HTTP 412).
+    PreconditionFailed(String),
+    /// The operation is not permitted on this resource (HTTP 405).
+    NotAllowed(String),
+    /// The broker does not implement this operation (HTTP 501).
+    NotSupported(String),
+    /// The broker is up but cannot serve the request yet (HTTP 503).
+    ServerUnavailable(String),
+    /// The Pulsar admin API returned a non-2xx status not covered above
     Http { status: u16, body: String },
+    /// A successful response body could not be deserialized
+    Decode(String),
     /// The Pulsar admin API returned schema JSON this client could not parse
     SchemaDecode(String),
     /// The Pulsar admin API returned an unknown schema type
@@ -522,10 +543,66 @@ pub enum AdminError {
 }
 
 #[cfg(feature = "admin-api")]
+impl AdminError {
+    /// Maps an HTTP status and response body onto the most specific variant.
+    ///
+    /// Pulsar reports failures as `{"reason": "..."}`; the reason is extracted so
+    /// the error message is the broker's own explanation rather than raw JSON.
+    pub(crate) fn from_status(status: u16, body: String) -> Self {
+        let reason = Self::reason(&body);
+        match status {
+            400 | 422 => AdminError::BadRequest(reason),
+            401 | 403 => AdminError::NotAuthorized(reason),
+            404 => AdminError::NotFound(reason),
+            405 => AdminError::NotAllowed(reason),
+            409 => AdminError::Conflict(reason),
+            412 => AdminError::PreconditionFailed(reason),
+            501 => AdminError::NotSupported(reason),
+            503 => AdminError::ServerUnavailable(reason),
+            _ => AdminError::Http { status, body },
+        }
+    }
+
+    fn reason(body: &str) -> String {
+        #[derive(serde::Deserialize)]
+        struct Reason {
+            reason: String,
+        }
+        match serde_json::from_str::<Reason>(body) {
+            Ok(r) if !r.reason.is_empty() => r.reason,
+            _ if body.trim().is_empty() => "<no message>".to_string(),
+            _ => body.trim().to_string(),
+        }
+    }
+
+    /// Whether retrying the same request could plausibly succeed.
+    ///
+    /// Only transient server-side conditions are retriable; a 4xx describes the
+    /// request itself and will fail identically on retry.
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            AdminError::ServerUnavailable(_) => true,
+            AdminError::Request(e) => e.is_timeout() || e.is_connect(),
+            AdminError::Http { status, .. } => *status >= 500,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(feature = "admin-api")]
 impl fmt::Display for AdminError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             AdminError::Request(e) => write!(f, "HTTP request failed: {e}"),
+            AdminError::NotFound(m) => write!(f, "not found: {m}"),
+            AdminError::Conflict(m) => write!(f, "conflict: {m}"),
+            AdminError::BadRequest(m) => write!(f, "bad request: {m}"),
+            AdminError::NotAuthorized(m) => write!(f, "not authorized: {m}"),
+            AdminError::PreconditionFailed(m) => write!(f, "precondition failed: {m}"),
+            AdminError::NotAllowed(m) => write!(f, "not allowed: {m}"),
+            AdminError::NotSupported(m) => write!(f, "not supported by the broker: {m}"),
+            AdminError::ServerUnavailable(m) => write!(f, "broker unavailable: {m}"),
+            AdminError::Decode(m) => write!(f, "could not decode admin response: {m}"),
             AdminError::Http { status, body } => {
                 write!(f, "admin API returned HTTP {status}: {body}")
             }
@@ -625,5 +702,110 @@ pub(crate) fn server_error(i: i32) -> Option<ServerError> {
         24 => Some(ServerError::TransactionNotFound),
         25 => Some(ServerError::ProducerFenced),
         _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "admin-api"))]
+mod admin_error_tests {
+    use super::AdminError;
+
+    /// Every status the mapper names, plus the fallthrough.
+    ///
+    /// This taxonomy is what nearly every error-path assertion in the suite keys
+    /// off, so a wrong mapping would quietly re-classify failures across the whole
+    /// admin client.
+    #[test]
+    fn statuses_map_to_their_variants() {
+        let body = |m: &str| format!(r#"{{"reason":"{m}"}}"#);
+        /// A status and the predicate its mapped variant must satisfy.
+        type Case = (u16, fn(&AdminError) -> bool);
+        let cases: Vec<Case> = vec![
+            (400, |e| matches!(e, AdminError::BadRequest(_))),
+            (422, |e| matches!(e, AdminError::BadRequest(_))),
+            (401, |e| matches!(e, AdminError::NotAuthorized(_))),
+            (403, |e| matches!(e, AdminError::NotAuthorized(_))),
+            (404, |e| matches!(e, AdminError::NotFound(_))),
+            (405, |e| matches!(e, AdminError::NotAllowed(_))),
+            (409, |e| matches!(e, AdminError::Conflict(_))),
+            (412, |e| matches!(e, AdminError::PreconditionFailed(_))),
+            (501, |e| matches!(e, AdminError::NotSupported(_))),
+            (503, |e| matches!(e, AdminError::ServerUnavailable(_))),
+            // Not named by the mapper, so they must fall through with the status
+            // preserved rather than being forced into a neighbouring variant.
+            (402, |e| matches!(e, AdminError::Http { status: 402, .. })),
+            (415, |e| matches!(e, AdminError::Http { status: 415, .. })),
+            (500, |e| matches!(e, AdminError::Http { status: 500, .. })),
+            (502, |e| matches!(e, AdminError::Http { status: 502, .. })),
+            (307, |e| matches!(e, AdminError::Http { status: 307, .. })),
+        ];
+        for (status, is_expected) in cases {
+            let error = AdminError::from_status(status, body("boom"));
+            assert!(
+                is_expected(&error),
+                "HTTP {status} mapped to the wrong variant: {error:?}"
+            );
+        }
+    }
+
+    /// The broker's own explanation is what surfaces, whatever the body looks like.
+    #[test]
+    fn the_reason_is_extracted_from_every_body_shape() {
+        let cases = [
+            (
+                r#"{"reason":"Namespace does not exist"}"#,
+                "Namespace does not exist",
+            ),
+            // Not JSON at all — Jetty's HTML page, which must survive verbatim so
+            // route-miss detection can still see it.
+            (
+                "<html><title>Error 404 Not Found</title></html>",
+                "<html><title>Error 404 Not Found</title></html>",
+            ),
+            // JSON without a `reason` key.
+            (r#"{"other":"x"}"#, r#"{"other":"x"}"#),
+            // Malformed JSON.
+            ("{not json", "{not json"),
+            // Empty, which must not produce an empty message.
+            ("", "<no message>"),
+            ("   ", "<no message>"),
+            // Present but empty `reason` falls back to the raw body.
+            (r#"{"reason":""}"#, r#"{"reason":""}"#),
+        ];
+        for (body, expected) in cases {
+            let error = AdminError::from_status(404, body.to_string());
+            let AdminError::NotFound(message) = &error else {
+                panic!("expected NotFound for {body:?}, got {error:?}");
+            };
+            assert_eq!(message, expected, "wrong reason extracted from {body:?}");
+        }
+    }
+
+    /// Only transient server-side conditions may be retried.
+    #[test]
+    fn only_transient_failures_are_retriable() {
+        let body = || r#"{"reason":"x"}"#.to_string();
+        assert!(AdminError::from_status(503, body()).is_retriable());
+        assert!(AdminError::from_status(500, body()).is_retriable());
+        assert!(AdminError::from_status(502, body()).is_retriable());
+
+        // A 4xx describes the request, so it fails identically on retry.
+        for status in [400, 401, 403, 404, 405, 409, 412, 422, 415] {
+            assert!(
+                !AdminError::from_status(status, body()).is_retriable(),
+                "HTTP {status} must not be retriable"
+            );
+        }
+        // 501 is a permanent statement about the broker, not a transient outage.
+        assert!(!AdminError::from_status(501, body()).is_retriable());
+
+        for error in [
+            AdminError::Decode("x".into()),
+            AdminError::InvalidTopic("x".into()),
+            AdminError::TlsConfig("x".into()),
+            AdminError::SchemaDecode("x".into()),
+            AdminError::InvalidSchemaType("x".into()),
+        ] {
+            assert!(!error.is_retriable(), "{error:?} must not be retriable");
+        }
     }
 }

@@ -14,6 +14,30 @@ pub(crate) fn broker_url() -> String {
         .to_string()
 }
 
+/// Admin REST base URL of the Pulsar **proxy**, when one is in the topology.
+///
+/// `proxy-stats` is served by a proxy rather than a broker, so those tests skip
+/// when this is unset. `scripts/start_test_broker.sh` exports it.
+///
+/// Gated on `admin-api` alongside its only callers, or it is dead code in the
+/// feature sets that exclude them.
+#[cfg(all(test, feature = "admin-api"))]
+pub(crate) fn proxy_admin_url() -> Option<String> {
+    std::env::var("PULSAR_PROXY_ADMIN_URL")
+        .ok()
+        .map(|u| u.trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+}
+
+/// Binary-protocol URL of the Pulsar proxy, when one is in the topology.
+#[cfg(all(test, feature = "admin-api"))]
+pub(crate) fn proxy_broker_url() -> Option<String> {
+    std::env::var("PULSAR_PROXY_URL")
+        .ok()
+        .map(|u| u.trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+}
+
 /// Admin REST base URL of the broker the integration tests run against.
 ///
 /// Override with `PULSAR_ADMIN_URL`; defaults to the standalone address CI

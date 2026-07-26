@@ -28,7 +28,7 @@ jobs:
         run: cargo clippy --tests --features telemetry,protobuf-src,admin-api -- -D warnings
 
       - name: Clippy (feature set B)
-        run: cargo clippy --tests --no-default-features --features compression,tokio-rustls-runtime,async-std-rustls-runtime,auth-oauth2,telemetry,protobuf-src -- -D warnings
+        run: cargo clippy --tests --no-default-features --features compression,tokio-rustls-runtime,async-std-rustls-runtime,auth-oauth2,telemetry,protobuf-src,admin-api -- -D warnings
 
       - name: Check format
         run: cargo fmt --all --check
@@ -47,20 +47,35 @@ jobs:
 
       - name: Start Pulsar Standalone Container
         run: |
+          # Keep this broker configuration in step with scripts/start_test_broker.sh,
+          # which is what the suite is developed against — a flag set there but not
+          # here fails only in CI (transactionCoordinatorEnabled is off by default,
+          # and the transaction tests need it).
+          #
           # `bin/pulsar standalone` does NOT apply PULSAR_PREFIX_* on its own, so
           # apply-config-from-env.py must run first — without it every -e below is
           # silently ignored and the run only works because the defaults happen to
           # match the port mapping. Notably advertisedAddress would stay empty, so
           # topic lookup would hand the client the container hostname and the suite
           # would depend on the runner being able to route to container IPs.
+          # 6750/8180 belong to the proxy started below: it joins this container's
+          # network namespace, and only the namespace's owner can publish ports.
           docker run --name pulsar \
             -p 6650:6650 -p 8080:8080 \
+            -p 6750:6750 -p 8180:8180 \
             -d \
             -e GITHUB_ACTIONS=true -e CI=true \
             -e PULSAR_PREFIX_advertisedAddress=127.0.0.1 \
             -e PULSAR_PREFIX_brokerServicePort=6650 \
             -e PULSAR_PREFIX_webServicePort=8080 \
             -e PULSAR_PREFIX_topicLevelPoliciesEnabled=true \
+            -e PULSAR_PREFIX_systemTopicEnabled=true \
+            -e PULSAR_PREFIX_allowAutoTopicCreation=true \
+            -e PULSAR_PREFIX_brokerDeduplicationEnabled=true \
+            -e PULSAR_PREFIX_transactionCoordinatorEnabled=true \
+            -e PULSAR_PREFIX_forceDeleteNamespaceAllowed=true \
+            -e PULSAR_PREFIX_forceDeleteTenantAllowed=true \
+            -e PULSAR_PREFIX_enablePackagesManagement=true \
             apachepulsar/pulsar:${{ matrix.pulsar-version }} \
             sh -c '
               set -e
@@ -125,20 +140,95 @@ jobs:
           wait_for "broker health" health_ok
           wait_for "namespace public/default" namespace_ok
 
+      - name: Start Pulsar Proxy
+        # `proxy-stats` is served by a proxy, not a broker, so those tests need one
+        # in the topology. It shares the broker's network namespace so that both
+        # resolve 127.0.0.1 to the same place: a client connecting through the proxy
+        # looks the topic up first and hands the proxy the broker's *advertised*
+        # address to dial, which is 127.0.0.1. On its own network that address would
+        # be the proxy itself and every connection would fail.
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --name pulsar-proxy \
+            --network container:pulsar \
+            -d \
+            -e PULSAR_PREFIX_servicePort=6750 \
+            -e PULSAR_PREFIX_webServicePort=8180 \
+            -e PULSAR_PREFIX_brokerServiceURL=pulsar://127.0.0.1:6650 \
+            -e PULSAR_PREFIX_brokerWebServiceURL=http://127.0.0.1:8080 \
+            -e PULSAR_PREFIX_advertisedAddress=127.0.0.1 \
+            -e PULSAR_PREFIX_clusterName=standalone \
+            -e PULSAR_PREFIX_proxyLogLevel=2 \
+            -e PULSAR_PREFIX_brokerProxyAllowedTargetPorts=6650 \
+            apachepulsar/pulsar:${{ matrix.pulsar-version }} \
+            sh -c '
+              set -e
+              bin/apply-config-from-env.py conf/proxy.conf
+              # proxyLogLevel must be 2 at *startup* for /proxy-stats/topics; the
+              # runtime setter only changes it in memory. Assert before starting so
+              # the check cannot race the rewrite.
+              grep -qx "proxyLogLevel=2" conf/proxy.conf
+              # Defaults to "6650,6651", so a broker on any other port would be
+              # refused with "Given port ... isn'"'"'t allowed".
+              grep -qx "brokerProxyAllowedTargetPorts=6650" conf/proxy.conf
+              echo "proxy PULSAR_PREFIX_* overrides applied"
+              exec bin/pulsar proxy
+            '
+
+          deadline=$(( SECONDS + 180 ))
+          echo "Waiting for proxy..."
+          while (( SECONDS < deadline )); do
+            if curl -sf http://127.0.0.1:8180/proxy-stats/connections >/dev/null 2>&1; then
+              echo "proxy ready (after $SECONDS seconds)"
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' pulsar-proxy 2>/dev/null)" != "true" ]; then
+              echo "proxy container exited"
+              docker logs --tail=100 pulsar-proxy || true
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "timed out waiting for proxy (after $SECONDS seconds)"
+          docker logs --tail=100 pulsar-proxy || true
+          exit 1
+
       - name: Run tests (serial, verbose)
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: pulsar=debug
           RUST_TEST_THREADS: 1
+          PULSAR_PROXY_URL: pulsar://127.0.0.1:6750
+          PULSAR_PROXY_ADMIN_URL: http://127.0.0.1:8180
         run: cargo test --features protobuf-src,admin-api -- --nocapture
+
+      - name: Run admin tests under async-std
+        # The admin client uses reqwest, which needs a Tokio reactor. Off Tokio it
+        # runs on a small runtime of its own; without this the bridge is only ever
+        # exercised locally, and a regression surfaces as a panic in users' code.
+        #
+        # `--no-default-features` matters: the defaults enable tokio-runtime too, so
+        # without it this would link Tokio and prove nothing about the isolated
+        # configuration. That is also why the tests live in an external target — the
+        # crate's own unit-test tree is Tokio-only and cannot build this way.
+        env:
+          RUST_BACKTRACE: 1
+          RUST_TEST_THREADS: 1
+        run: |
+          cargo test --no-default-features \
+            --features protobuf-src,admin-api,async-std-runtime \
+            --test async_std_admin
 
       - name: Dump Pulsar logs on failure
         if: failure()
         run: |
           echo "==== PULSAR CONTAINER LOGS ===="
           docker logs pulsar || true
+          echo "==== PULSAR PROXY LOGS ===="
+          docker logs pulsar-proxy || true
 
       - name: Stop Pulsar
         if: always()
-        run: docker rm -f pulsar || true
+        run: docker rm -f pulsar-proxy pulsar || true
 
