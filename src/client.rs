@@ -185,6 +185,7 @@ impl<Exe: Executor> Pulsar<Exe> {
         tls_options: Option<TlsOptions>,
         outbound_channel_size: Option<usize>,
         executor: Exe,
+        listener_name: Option<String>,
     ) -> Result<Self, Error> {
         let url: String = url.into();
         let executor = Arc::new(executor);
@@ -198,6 +199,7 @@ impl<Exe: Executor> Pulsar<Exe> {
             tls_options,
             outbound_channel_size,
             executor.clone(),
+            listener_name,
         )
         .await?;
         let manager = Arc::new(manager);
@@ -260,6 +262,7 @@ impl<Exe: Executor> Pulsar<Exe> {
             operation_retry_options: None,
             tls_options: None,
             outbound_channel_size: None,
+            listener_name: None,
             executor,
         }
     }
@@ -565,6 +568,7 @@ pub struct PulsarBuilder<Exe: Executor> {
     operation_retry_options: Option<OperationRetryOptions>,
     tls_options: Option<TlsOptions>,
     outbound_channel_size: Option<usize>,
+    listener_name: Option<String>,
     executor: Exe,
 }
 
@@ -669,6 +673,26 @@ impl<Exe: Executor> PulsarBuilder<Exe> {
         self
     }
 
+    /// Asks the broker to resolve lookups against one of its named
+    /// `advertisedListeners` sets instead of the default one.
+    ///
+    /// A broker can advertise itself under several addresses at once — an
+    /// in-cluster one and an externally routable one, say. Without a listener
+    /// name it hands back the default set, which a client outside that network
+    /// cannot dial. The name must match a key the broker was configured with;
+    /// an unknown one fails the lookup rather than falling back.
+    ///
+    /// Note that the broker reports that mismatch as `ServiceNotReady`, which
+    /// lookup retries indefinitely under the default
+    /// [`OperationRetryOptions`][crate::connection_manager::OperationRetryOptions].
+    /// A misspelt listener name therefore stalls rather than erroring; set
+    /// `max_retries` if you would rather see the failure.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn with_listener_name<S: Into<String>>(mut self, listener_name: S) -> Self {
+        self.listener_name = Some(listener_name.into());
+        self
+    }
+
     /// creates the Pulsar client and connects it
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn build(self) -> Result<Pulsar<Exe>, Error> {
@@ -679,6 +703,7 @@ impl<Exe: Executor> PulsarBuilder<Exe> {
             operation_retry_options,
             tls_options,
             outbound_channel_size,
+            listener_name,
             executor,
         } = self;
 
@@ -690,6 +715,7 @@ impl<Exe: Executor> PulsarBuilder<Exe> {
             tls_options,
             outbound_channel_size,
             executor,
+            listener_name,
         )
         .await?;
 

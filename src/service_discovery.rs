@@ -63,7 +63,11 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
         loop {
             let response = match conn
                 .sender()
-                .lookup_topic(topic.to_string(), is_authoritative)
+                .lookup_topic(
+                    topic.to_string(),
+                    is_authoritative,
+                    self.manager.listener_name.clone(),
+                )
                 .await
             {
                 Ok(res) => res,
@@ -71,7 +75,11 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
                     error!("tried to lookup a topic but connection was closed, reconnecting...");
                     conn = self.manager.get_connection(&broker_address).await?;
                     conn.sender()
-                        .lookup_topic(topic.to_string(), is_authoritative)
+                        .lookup_topic(
+                            topic.to_string(),
+                            is_authoritative,
+                            self.manager.listener_name.clone(),
+                        )
                         .await?
                 }
                 Err(e) => {
@@ -430,5 +438,65 @@ mod tests {
                 "{topic} must not be treated as a partition name"
             );
         }
+    }
+
+    /// A configured listener name resolves, and an unconfigured one is refused.
+    ///
+    /// The refusal half is the real assertion, and it doubles as this test's own
+    /// negative control: the broker fails a lookup naming a listener it does not
+    /// have (`NamespaceService.resolveBrokerServiceLookupResult`), so if the
+    /// client stopped putting the name on `CommandLookupTopic` the lookup would
+    /// succeed and this test would fail. Nothing else in the suite would notice.
+    ///
+    /// `scripts/start_test_broker.sh` configures the "external" listener.
+    #[tokio::test]
+    #[cfg_attr(not(feature = "admin-api"), ignore)]
+    async fn lookups_resolve_against_the_named_listener() {
+        use crate::{
+            client::Pulsar, connection_manager::OperationRetryOptions, executor::TokioExecutor,
+            test_utils::broker_url,
+        };
+
+        let topic = "persistent://public/default/listener-name-lookup";
+
+        let configured: Pulsar<_> = Pulsar::builder(broker_url(), TokioExecutor)
+            .with_listener_name("external")
+            .build()
+            .await
+            .unwrap();
+        let via_listener = configured.lookup_topic(topic).await.unwrap();
+
+        // The listener advertises the address the broker already serves on, so
+        // resolving through it must land on the same broker as the default path.
+        let plain: Pulsar<_> = Pulsar::builder(broker_url(), TokioExecutor)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            via_listener.broker_url,
+            plain.lookup_topic(topic).await.unwrap().broker_url
+        );
+
+        // The broker reports a missing listener as `ServiceNotReady`, which this
+        // client retries indefinitely by default, so a misconfigured listener name
+        // hangs rather than failing. Bound the retries to see the error itself.
+        let unconfigured: Pulsar<_> = Pulsar::builder(broker_url(), TokioExecutor)
+            .with_listener_name("no-such-listener")
+            .with_operation_retry_options(OperationRetryOptions {
+                max_retries: Some(0),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let err = unconfigured
+            .lookup_topic(topic)
+            .await
+            .expect_err("the broker has no 'no-such-listener' listener");
+        let message = err.to_string();
+        assert!(
+            message.contains("no-such-listener"),
+            "the broker should name the listener it is missing, got: {message}"
+        );
     }
 }

@@ -468,9 +468,10 @@ impl<Exe: Executor> ConnectionSender<Exe> {
         &self,
         topic: S,
         authoritative: bool,
+        listener_name: Option<String>,
     ) -> Result<proto::CommandLookupTopicResponse, ConnectionError> {
         let request_id = self.request_id.get();
-        let msg = messages::lookup_topic(topic.into(), authoritative, request_id);
+        let msg = messages::lookup_topic(topic.into(), authoritative, request_id, listener_name);
         self.send_message(msg, RequestKey::RequestId(request_id), |resp| {
             resp.command.lookup_topic_response
         })
@@ -1729,7 +1730,15 @@ pub(crate) mod messages {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub fn lookup_topic(topic: String, authoritative: bool, request_id: u64) -> Message {
+    /// `listener_name` selects one of the broker's `advertisedListeners` sets, so a
+    /// client outside the broker's own network is handed an address it can reach.
+    /// Only this command carries it — not connect, and not partitioned metadata.
+    pub fn lookup_topic(
+        topic: String,
+        authoritative: bool,
+        request_id: u64,
+        listener_name: Option<String>,
+    ) -> Message {
         Message {
             command: proto::BaseCommand {
                 r#type: CommandType::Lookup as i32,
@@ -1737,6 +1746,7 @@ pub(crate) mod messages {
                     topic,
                     request_id,
                     authoritative: Some(authoritative),
+                    advertised_listener_name: listener_name,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2089,6 +2099,21 @@ mod tests {
             let req = msg.command.partition_metadata.expect("partition metadata");
             assert_eq!(req.metadata_auto_creation_enabled, Some(enabled));
         }
+    }
+
+    /// The listener name rides on the lookup and nowhere else. Java sets it in
+    /// `Commands.newLookup` only; a broker that receives it on a request it does
+    /// not expect has no reason to honour it, and one that receives it when the
+    /// client configured no listener fails the lookup outright.
+    #[test]
+    fn lookup_carries_the_listener_name_only_when_one_is_configured() {
+        let named = messages::lookup_topic("t".to_string(), true, 1, Some("external".to_string()));
+        let lookup = named.command.lookup_topic.expect("lookup command");
+        assert_eq!(lookup.advertised_listener_name.as_deref(), Some("external"));
+
+        let unnamed = messages::lookup_topic("t".to_string(), true, 1, None);
+        let lookup = unnamed.command.lookup_topic.expect("lookup command");
+        assert_eq!(lookup.advertised_listener_name, None);
     }
 
     use std::{sync::Arc, time::Duration};

@@ -180,6 +180,12 @@ pub struct ConnectionManager<Exe: Executor> {
     pub(crate) tls_options: TlsOptions,
     certificate_chain: Vec<Certificate>,
     outbound_channel_size: usize,
+    /// Selects one of the broker's `advertisedListeners` sets on topic lookup.
+    ///
+    /// Set it when the client sits outside the network the broker advertises by
+    /// default — a Kubernetes cluster reached from outside, say — so lookup hands
+    /// back an address the client can actually dial.
+    pub(crate) listener_name: Option<String>,
 }
 
 impl<Exe: Executor> ConnectionManager<Exe> {
@@ -192,6 +198,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
         tls: Option<TlsOptions>,
         outbound_channel_size: usize,
         executor: Arc<Exe>,
+        listener_name: Option<String>,
     ) -> Result<Self, ConnectionError> {
         let connection_retry_options = connection_retry.unwrap_or_default();
         let tls_options = tls.unwrap_or_default();
@@ -248,6 +255,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
             tls_options,
             certificate_chain,
             outbound_channel_size,
+            listener_name,
         };
         let broker_address = BrokerAddress {
             url: url.clone(),

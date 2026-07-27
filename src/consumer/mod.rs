@@ -225,12 +225,17 @@ impl<T: DeserializeMessage, Exe: Executor> Consumer<T, Exe> {
                 let namespace = c.namespace.clone();
                 let config = c.config().clone();
                 let topic_regex = c.topic_regex.clone();
+                // Carry the unresolved names across the rebuild, or the refresh
+                // would be reseeded with `-partition-N` names and stop finding
+                // partitions added after this seek.
+                let requested_topics = c.requested_topics.clone();
                 InnerConsumer::Multi(MultiTopicConsumer {
                     namespace,
                     topic_regex,
                     pulsar: client,
                     consumers,
                     topics,
+                    requested_topics,
                     existing_topics,
                     new_consumers: None,
                     refresh,
@@ -1829,5 +1834,138 @@ mod tests {
         );
 
         consumer.ack(&msg).await.unwrap();
+    }
+
+    /// A consumer must start consuming partitions added after it subscribed,
+    /// otherwise messages published to the new partitions are never delivered.
+    ///
+    /// Parameterised on the starting count because the two cases go down
+    /// different paths: more than one partition builds a `MultiTopicConsumer`,
+    /// which already re-checks on its refresh interval, while exactly one builds
+    /// a `Single` consumer.
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn assert_consumer_follows_partition_growth(initial: i32) {
+        use crate::{producer::ProducerOptions, routing_policy::RoutingPolicy};
+
+        let _result = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+
+        let pulsar: Pulsar<_> = Pulsar::builder(crate::test_utils::broker_url(), TokioExecutor)
+            .build()
+            .await
+            .unwrap();
+        let admin = pulsar.admin(crate::test_utils::admin_url()).unwrap();
+
+        let topic = format!(
+            "persistent://public/default/cgrow{initial}-{}",
+            rand::random::<u32>()
+        );
+        admin
+            .topics()
+            .create_partitioned_topic(&topic, initial)
+            .await
+            .unwrap();
+
+        let mut consumer: Consumer<String, _> = pulsar
+            .consumer()
+            .with_topic(&topic)
+            .with_subscription("follow-growth")
+            .with_subscription_type(SubType::Shared)
+            .with_topic_refresh(Duration::from_millis(100))
+            .build()
+            .await
+            .unwrap();
+
+        let grown = initial + 3;
+        admin
+            .topics()
+            .update_partitioned_topic(&topic, grown)
+            .await
+            .unwrap();
+
+        // Round-robin over every partition, so the new ones certainly get one.
+        let mut producer = pulsar
+            .producer()
+            .with_topic(&topic)
+            .with_options(ProducerOptions {
+                routing_policy: Some(RoutingPolicy::RoundRobin),
+                ..Default::default()
+            })
+            .with_partition_refresh(Duration::from_millis(1))
+            .build()
+            .await
+            .unwrap();
+        for i in 0..(grown * 3) {
+            producer
+                .send_non_blocking(format!("m{i}"))
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            producer.partitions().map(|p| p.len()),
+            Some(grown as usize),
+            "the producer must publish to every partition or the test proves nothing"
+        );
+
+        // Every partition holds at least one message, so seeing one from each is
+        // proof the consumer is attached to all of them.
+        let mut seen: HashSet<String> = HashSet::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while seen.len() < grown as usize && std::time::Instant::now() < deadline {
+            match timeout(Duration::from_secs(1), consumer.next()).await {
+                Ok(Some(Ok(msg))) => {
+                    seen.insert(msg.topic.clone());
+                    consumer.ack(&msg).await.unwrap();
+                }
+                Ok(None) => break,
+                Ok(Some(Err(e))) => panic!("consumer error: {e}"),
+                Err(_) => {}
+            }
+        }
+
+        let want: HashSet<String> = (0..grown)
+            .map(|n| format!("{topic}-partition-{n}"))
+            .collect();
+        assert_eq!(
+            seen, want,
+            "consumer did not follow the topic from {initial} to {grown} partitions"
+        );
+
+        producer.close().await.unwrap();
+        admin
+            .topics()
+            .delete_partitioned_topic(&topic, true)
+            .await
+            .unwrap();
+    }
+
+    /// More than one partition to start: this is the `MultiTopicConsumer` path.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    #[cfg_attr(not(feature = "admin-api"), ignore)]
+    async fn a_consumer_follows_partition_growth_from_two() {
+        assert_consumer_follows_partition_growth(2).await;
+    }
+
+    /// Exactly one partition to start.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    #[cfg_attr(not(feature = "admin-api"), ignore)]
+    async fn a_consumer_follows_partition_growth_from_one() {
+        assert_consumer_follows_partition_growth(1).await;
     }
 }

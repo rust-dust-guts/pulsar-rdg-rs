@@ -28,6 +28,13 @@ pub struct MultiTopicConsumer<T: DeserializeMessage, Exe: Executor> {
     pub(super) pulsar: Pulsar<Exe>,
     pub(super) consumers: BTreeMap<String, Pin<Box<TopicConsumer<T, Exe>>>>,
     pub(super) topics: VecDeque<String>,
+    /// The topics as the caller named them, before partition lookup resolved them
+    /// into `-partition-N` names.
+    ///
+    /// [`update_topics`][Self::update_topics] has to re-look-up *these*: resolving
+    /// `orders-partition-0` only ever yields itself, so seeding the refresh with
+    /// resolved names means a partition added later is never discovered.
+    pub(super) requested_topics: VecDeque<String>,
     pub(super) existing_topics: VecDeque<String>,
     #[allow(clippy::type_complexity)]
     pub(super) new_consumers: Option<
@@ -151,7 +158,7 @@ impl<T: DeserializeMessage, Exe: Executor> MultiTopicConsumer<T, Exe> {
 
         // 1. get topics
         // 1.1 original topics from builder
-        let mut topics = self.topics.clone();
+        let mut topics = self.requested_topics.clone();
 
         self.new_consumers = Some(Box::pin(async move {
             // 1.2 append topics which match `topic_regex`

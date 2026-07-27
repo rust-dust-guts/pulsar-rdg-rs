@@ -48,6 +48,11 @@ Added in this fork:
 - **Protocol feature negotiation** — the client advertises what it implements and reads the broker's
   capabilities back via `Pulsar::broker_features()`;
 - **PIP-344 partition metadata lookup without topic auto-creation**;
+- **Advertised listener selection** — `PulsarBuilder::with_listener_name`, so a client outside the
+  broker's own network gets an address it can reach instead of an internal one;
+- **Producers and consumers follow a topic as it grows** — adding partitions to a live topic used to
+  strand the new ones: they got no traffic, and keyed messages landed on a different partition than
+  a Java client would pick. Both sides now re-check, as Java's `autoUpdatePartitions` does;
 - **Chunked messages detected and rejected** rather than delivered as truncated payloads;
 - Wire protocol brought to field-level parity with Pulsar 5.0 for all non-scalable-topic messages;
 - **A near-complete Admin API** — 498 operations across all 21 of the Java client's admin interfaces,
@@ -119,6 +124,22 @@ empty payload. The unit type carries no value, so that is the honest mapping —
 
 A binary key is hashed in its base64 form, matching Java. Sending the same key from a Java and a Rust
 producer therefore lands on the same partition.
+
+### Single-partition topics are now treated as partitioned
+
+A topic created with **one** partition used to build the same internal producer and consumer as a
+non-partitioned topic, which is why neither could follow it when it was later grown. Both now take
+the partitioned path. One observable change follows: `Producer::partitions()` returns
+`Some(["…-partition-0"])` where it returned `None`. `Consumer::topics()` is unaffected — it already
+reported the resolved `…-partition-0` name on both paths.
+
+Genuinely non-partitioned topics are unaffected — they cannot gain partitions, so they keep the
+single-consumer path and never re-check.
+
+Producers re-check every 60 seconds by default, matching Java's `autoUpdatePartitions`; the check
+runs on the next send after the interval elapses, so an idle producer costs nothing. Configure it
+with `ProducerBuilder::with_partition_refresh`, or turn it off with `without_partition_refresh`.
+Consumers use the existing `ConsumerBuilder::with_topic_refresh` interval (30 seconds by default).
 
 ### Admin API source breaks
 

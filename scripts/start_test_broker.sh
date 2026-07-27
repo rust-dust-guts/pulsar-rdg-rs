@@ -70,12 +70,19 @@ docker rm -f "${CONTAINER_NAME}" "${PROXY_NAME}" >/dev/null 2>&1 || true
 # The proxy's ports are published here, not on the proxy container: the proxy
 # joins this container's network namespace (see below) and only the container that
 # owns a namespace can publish ports into it.
+#
+# `advertisedListeners` names one extra listener, "external", pointing at the same
+# address the broker already advertises. It exists for the listener-name tests and
+# is inert for everything else: a lookup that names no listener keeps getting the
+# default URLs, and `internalListenerName` still resolves to the "internal" entry
+# synthesized from brokerServicePort/webServicePort.
 docker run -d --name "${CONTAINER_NAME}" \
   -p "${BROKER_PORT}:${BROKER_PORT}" -p "${ADMIN_PORT}:${ADMIN_PORT}" \
   -p "${PROXY_PORT}:${PROXY_PORT}" -p "${PROXY_WEB_PORT}:${PROXY_WEB_PORT}" \
   -e PULSAR_PREFIX_brokerServicePort="${BROKER_PORT}" \
   -e PULSAR_PREFIX_webServicePort="${ADMIN_PORT}" \
   -e PULSAR_PREFIX_advertisedAddress=127.0.0.1 \
+  -e PULSAR_PREFIX_advertisedListeners="external:pulsar://127.0.0.1:${BROKER_PORT}" \
   -e PULSAR_PREFIX_topicLevelPoliciesEnabled=true \
   -e PULSAR_PREFIX_systemTopicEnabled=true \
   -e PULSAR_PREFIX_allowAutoTopicCreation=true \

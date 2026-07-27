@@ -1,7 +1,7 @@
 //! Message publication
 use std::{
     borrow::Cow,
-    collections::{btree_map::Entry, BTreeMap, HashMap, VecDeque},
+    collections::{btree_map::Entry, BTreeMap, HashMap, HashSet, VecDeque},
     io::Write,
     num::NonZeroUsize,
     pin::Pin,
@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -541,6 +541,7 @@ impl<Exe: Executor> Producer<Exe> {
         match &mut self.inner {
             ProducerInner::Single(p) => p.send(serialized_message).await,
             ProducerInner::Partitioned(p) => {
+                p.refresh_partitions().await;
                 p.choose_partition(&serialized_message)
                     .send(serialized_message)
                     .await
@@ -588,6 +589,9 @@ impl<Exe: Executor> Producer<Exe> {
         T: SerializeMessage,
         I: IntoIterator<Item = T>,
     {
+        if let ProducerInner::Partitioned(p) = &mut self.inner {
+            p.refresh_partitions().await;
+        }
         let mut sends = Vec::new();
         for message in messages {
             let serialized_message = T::serialize_message(message)?;
@@ -636,15 +640,121 @@ enum ProducerInner<Exe: Executor> {
     Partitioned(PartitionedProducer<Exe>),
 }
 
+/// How often a producer re-checks its topic's partition count by default.
+///
+/// Matches Java's `autoUpdatePartitionsIntervalSeconds`.
+const DEFAULT_PARTITION_REFRESH: Duration = Duration::from_secs(60);
+
+/// Partition index encoded in a resolved partition name, e.g. `3` for
+/// `persistent://public/default/orders-partition-3`.
+///
+/// Deliberately strict about the suffix: `orders-partition-archive` is an
+/// ordinary topic, not partition "archive".
+fn partition_index(topic: &str) -> Option<usize> {
+    let (prefix, index) = topic.rsplit_once("-partition-")?;
+    if prefix.is_empty() {
+        return None;
+    }
+    index.parse().ok()
+}
+
 struct PartitionedProducer<Exe: Executor> {
     // Guaranteed to be non-empty
     producers: Vec<TopicProducer<Exe>>,
     last_used_producer_index: usize,
     topic: String,
     options: ProducerOptions,
+    /// Everything a partition re-check needs, plus when the last one ran.
+    ///
+    /// `None` disables the check. Time is measured with [`Instant`] rather than
+    /// [`Executor::interval`] on purpose: the two runtimes disagree on whether an
+    /// interval fires immediately, and elapsed-since is the same under both.
+    partition_refresh: Option<Duration>,
+    last_partition_check: Instant,
+    pulsar: Pulsar<Exe>,
+    name: Option<String>,
 }
 
 impl<Exe: Executor> PartitionedProducer<Exe> {
+    /// Starts producers for partitions added since the last check, at most once
+    /// per configured interval.
+    ///
+    /// A partitioned topic can be grown at any time, and a producer that never
+    /// re-checks keeps routing over the original set. The new partitions get no
+    /// traffic, and — worse — a keyed message lands on a different partition than
+    /// a client that did notice, so per-key ordering breaks across the fleet. That
+    /// is the same failure `HashingScheme` exists to prevent.
+    ///
+    /// Failures are logged and swallowed. A partition re-check is background work
+    /// that a send merely happens to drive, so a transient lookup error must not
+    /// fail that send; Java takes the same view, its
+    /// `partitionsAutoUpdateTimerTask` catching everything and rescheduling.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    async fn refresh_partitions(&mut self) {
+        match self.partition_refresh {
+            Some(interval) if self.last_partition_check.elapsed() >= interval => {}
+            _ => return,
+        }
+        self.last_partition_check = Instant::now();
+
+        let found = match self.pulsar.lookup_partitioned_topic(&self.topic).await {
+            Ok(found) => found,
+            Err(e) => {
+                warn!(
+                    "could not re-check the partitions of {}, keeping the current {}: {}",
+                    self.topic,
+                    self.producers.len(),
+                    e
+                );
+                return;
+            }
+        };
+
+        // Match on name rather than on count: it needs no assumption about which
+        // indices are new, and Pulsar only ever appends partitions.
+        let known: HashSet<&str> = self.producers.iter().map(|p| p.topic()).collect();
+        let added: Vec<_> = found
+            .into_iter()
+            .filter(|(topic, _)| !known.contains(topic.as_str()))
+            .collect();
+        if added.is_empty() {
+            return;
+        }
+
+        let created = try_join_all(added.into_iter().map(|(topic, addr)| {
+            TopicProducer::new(
+                self.pulsar.clone(),
+                addr,
+                topic,
+                self.name.clone(),
+                self.options.clone(),
+            )
+        }))
+        .await;
+
+        match created {
+            Ok(mut created) => {
+                info!(
+                    "{} grew from {} to {} partitions",
+                    self.topic,
+                    self.producers.len(),
+                    self.producers.len() + created.len()
+                );
+                self.producers.append(&mut created);
+                // Keyed routing indexes this vector by partition number, so the
+                // order has to be the partition order rather than creation order.
+                self.producers
+                    .sort_by_key(|p| partition_index(p.topic()).unwrap_or(usize::MAX));
+            }
+            Err(e) => warn!(
+                "could not start producers for the new partitions of {}, keeping the current {}: {}",
+                self.topic,
+                self.producers.len(),
+                e
+            ),
+        }
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn get_next_round_robin_producer(&mut self) -> &mut TopicProducer<Exe> {
         let amount_of_producers = self.producers.len();
@@ -1162,6 +1272,7 @@ pub struct ProducerBuilder<Exe: Executor> {
     topic: Option<String>,
     name: Option<String>,
     producer_options: Option<ProducerOptions>,
+    partition_refresh: Option<Duration>,
 }
 
 impl<Exe: Executor> ProducerBuilder<Exe> {
@@ -1173,6 +1284,7 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
             topic: None,
             name: None,
             producer_options: None,
+            partition_refresh: Some(DEFAULT_PARTITION_REFRESH),
         }
     }
 
@@ -1180,6 +1292,34 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn with_topic<S: Into<String>>(mut self, topic: S) -> Self {
         self.topic = Some(topic.into());
+        self
+    }
+
+    /// How often to re-check whether the topic has gained partitions.
+    ///
+    /// A partitioned topic can be grown at any time, and a producer that never
+    /// re-checks keeps routing over the partitions it started with: the new ones
+    /// receive nothing, and keyed messages land somewhere other than where a
+    /// client that did notice would put them.
+    ///
+    /// The check runs on the next send after the interval has elapsed, so an idle
+    /// producer does no work; it costs one topic lookup. Java's equivalent pair is
+    /// `autoUpdatePartitions` and `autoUpdatePartitionsInterval`, and this shares
+    /// its default of 60 seconds. Non-partitioned topics never re-check, since
+    /// they cannot gain partitions.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn with_partition_refresh(mut self, interval: Duration) -> Self {
+        self.partition_refresh = Some(interval);
+        self
+    }
+
+    /// Never re-check the topic's partition count.
+    ///
+    /// See [`with_partition_refresh`][Self::with_partition_refresh] for what this
+    /// gives up.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn without_partition_refresh(mut self) -> Self {
+        self.partition_refresh = None;
         self
     }
 
@@ -1205,44 +1345,56 @@ impl<Exe: Executor> ProducerBuilder<Exe> {
             topic,
             name,
             producer_options,
+            partition_refresh,
         } = self;
         let topic = topic.ok_or_else(|| Error::Custom("topic not set".to_string()))?;
         let options = producer_options.unwrap_or_default();
 
-        let mut producers: Vec<TopicProducer<Exe>> = try_join_all(
-            pulsar
-                .lookup_partitioned_topic(&topic)
-                .await?
-                .into_iter()
-                .map(|(topic, addr)| {
-                    let name = name.clone();
-                    let options = options.clone();
-                    let pulsar = pulsar.clone();
-                    async move {
-                        let producer =
-                            TopicProducer::new(pulsar, addr, topic, name, options).await?;
-                        Ok::<TopicProducer<Exe>, Error>(producer)
-                    }
-                }),
-        )
-        .await?;
+        let partitions = pulsar.lookup_partitioned_topic(&topic).await?;
 
-        // sort by partition id
-        producers.sort_by_key(|prod| prod.id);
+        // `lookup_partitioned_topic` echoes the topic back unchanged when it is not
+        // partitioned, and returns `-partition-N` names when it is. That, rather
+        // than the count, is what decides the two cases below: a one-partition
+        // topic is still partitioned and can still grow.
+        let is_partitioned = partitions.first().is_some_and(|(first, _)| first != &topic);
 
-        let producer = match producers.len() {
-            0 => {
-                return Err(Error::Custom(format!(
-                    "Unexpected error: Partition lookup returned no topics for {topic}"
-                )));
-            }
-            1 => ProducerInner::Single(producers.into_iter().next().unwrap()),
-            len => ProducerInner::Partitioned(PartitionedProducer {
+        let mut producers: Vec<TopicProducer<Exe>> =
+            try_join_all(partitions.into_iter().map(|(topic, addr)| {
+                let name = name.clone();
+                let options = options.clone();
+                let pulsar = pulsar.clone();
+                async move {
+                    let producer = TopicProducer::new(pulsar, addr, topic, name, options).await?;
+                    Ok::<TopicProducer<Exe>, Error>(producer)
+                }
+            }))
+            .await?;
+
+        // Keyed routing indexes this vector by partition number, so sort by that
+        // and not by `prod.id`, which is a process-wide producer counter that only
+        // happens to agree with partition order.
+        producers.sort_by_key(|prod| partition_index(prod.topic()).unwrap_or(usize::MAX));
+
+        if producers.is_empty() {
+            return Err(Error::Custom(format!(
+                "Unexpected error: Partition lookup returned no topics for {topic}"
+            )));
+        }
+
+        let producer = if is_partitioned {
+            let len = producers.len();
+            ProducerInner::Partitioned(PartitionedProducer {
                 producers,
                 last_used_producer_index: rand::thread_rng().gen_range(0..len),
                 topic,
+                partition_refresh,
+                last_partition_check: Instant::now(),
+                pulsar,
+                name,
                 options,
-            }),
+            })
+        } else {
+            ProducerInner::Single(producers.into_iter().next().unwrap())
         };
 
         Ok(Producer { inner: producer })
@@ -1649,6 +1801,29 @@ mod tests {
     use crate::{
         routing_policy::CustomRoutingPolicy, test_utils, tests::TEST_LOGGER, TokioExecutor,
     };
+
+    /// Keyed routing indexes the producer vector by partition number, so an
+    /// index parsed from the wrong shape of name would silently misroute.
+    #[test]
+    fn partition_index_reads_only_real_partition_suffixes() {
+        assert_eq!(
+            partition_index("persistent://public/default/orders-partition-3"),
+            Some(3)
+        );
+        assert_eq!(partition_index("orders-partition-0"), Some(0));
+        assert_eq!(partition_index("orders-partition-12"), Some(12));
+
+        for topic in [
+            "orders",
+            "orders-partition-",
+            "orders-partition-archive",
+            "orders-partition-3x",
+            "orders-partition--1",
+            "-partition-0",
+        ] {
+            assert_eq!(partition_index(topic), None, "{topic} is not a partition");
+        }
+    }
 
     #[test]
     fn send_future_errors_when_sender_dropped() {
@@ -2431,5 +2606,147 @@ mod tests {
 
             assert!(send_receipt.producer_id == producer_id);
         }
+    }
+
+    /// A producer picks up partitions added after it was built.
+    ///
+    /// Without this, a producer keeps routing over the partitions it started with:
+    /// the new ones receive nothing, and a keyed message lands somewhere other
+    /// than where a Java client — which auto-updates by default — would put it, so
+    /// per-key ordering breaks across a mixed fleet.
+    ///
+    /// Starts at **one** partition on purpose. That was the case with no coverage
+    /// at all: a one-partition topic used to build a `Single` producer, which has
+    /// no partition set to grow.
+    #[tokio::test]
+    #[cfg_attr(not(feature = "admin-api"), ignore)]
+    async fn a_producer_picks_up_partitions_added_after_it_was_built() {
+        let _result = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+
+        let pulsar: Pulsar<_> = Pulsar::builder(test_utils::broker_url(), TokioExecutor)
+            .build()
+            .await
+            .unwrap();
+        let admin = pulsar.admin(test_utils::admin_url()).unwrap();
+
+        let topic = format!("persistent://public/default/grow-{}", rand::random::<u32>());
+        admin
+            .topics()
+            .create_partitioned_topic(&topic, 1)
+            .await
+            .unwrap();
+
+        let mut producer = pulsar
+            .producer()
+            .with_topic(&topic)
+            .with_partition_refresh(Duration::from_millis(1))
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            producer.partitions(),
+            Some(vec![format!("{topic}-partition-0")]),
+            "a one-partition topic is still partitioned, and can still grow"
+        );
+
+        admin
+            .topics()
+            .update_partitioned_topic(&topic, 4)
+            .await
+            .unwrap();
+
+        // The refresh runs on the next send, not on a timer, so it takes one send
+        // to notice. Send twice: the first triggers the re-check, the second is
+        // routed over the grown set.
+        for _ in 0..2 {
+            producer
+                .send_non_blocking("x")
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+
+        let mut partitions = producer.partitions().expect("still partitioned");
+        partitions.sort();
+        assert_eq!(
+            partitions,
+            (0..4)
+                .map(|n| format!("{topic}-partition-{n}"))
+                .collect::<Vec<_>>(),
+            "the producer should have caught up with the topic"
+        );
+
+        producer.close().await.unwrap();
+        admin
+            .topics()
+            .delete_partitioned_topic(&topic, true)
+            .await
+            .unwrap();
+    }
+
+    /// Opting out means opting out: no lookup, no new partitions.
+    ///
+    /// This is the negative control for the test above — it fails if the refresh
+    /// ignores its configuration and runs unconditionally.
+    #[tokio::test]
+    #[cfg_attr(not(feature = "admin-api"), ignore)]
+    async fn a_producer_that_opted_out_keeps_its_original_partitions() {
+        let _result = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+
+        let pulsar: Pulsar<_> = Pulsar::builder(test_utils::broker_url(), TokioExecutor)
+            .build()
+            .await
+            .unwrap();
+        let admin = pulsar.admin(test_utils::admin_url()).unwrap();
+
+        let topic = format!(
+            "persistent://public/default/nogrow-{}",
+            rand::random::<u32>()
+        );
+        admin
+            .topics()
+            .create_partitioned_topic(&topic, 1)
+            .await
+            .unwrap();
+
+        let mut producer = pulsar
+            .producer()
+            .with_topic(&topic)
+            .without_partition_refresh()
+            .build()
+            .await
+            .unwrap();
+
+        admin
+            .topics()
+            .update_partitioned_topic(&topic, 4)
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            producer
+                .send_non_blocking("x")
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            producer.partitions(),
+            Some(vec![format!("{topic}-partition-0")]),
+            "a producer that opted out must not re-check"
+        );
+
+        producer.close().await.unwrap();
+        admin
+            .topics()
+            .delete_partitioned_topic(&topic, true)
+            .await
+            .unwrap();
     }
 }

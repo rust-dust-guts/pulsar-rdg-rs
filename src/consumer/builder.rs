@@ -278,7 +278,16 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
         }))
         .await?;
 
-        let consumer = if consumers.len() == 1 {
+        // A single consumer is only enough when its topic cannot gain partitions.
+        // `validate` echoes a non-partitioned topic back unchanged and resolves a
+        // partitioned one to `-partition-N`, so a name that came back changed is
+        // partitioned — even at one partition — and needs the multi-consumer's
+        // refresh to follow the topic as it grows. A regex always needs it too.
+        let requested: Vec<String> = self.topics.clone().unwrap_or_default();
+        let can_gain_partitions = self.topic_regex.is_some()
+            || !matches!((&requested[..], &consumers[..]), ([only], [resolved]) if resolved.topic() == *only);
+
+        let consumer = if consumers.len() == 1 && !can_gain_partitions {
             let consumer = consumers.into_iter().next().unwrap();
             InnerConsumer::Single(consumer)
         } else {
@@ -300,6 +309,7 @@ impl<Exe: Executor> ConsumerBuilder<Exe> {
                 pulsar: self.pulsar,
                 consumers,
                 topics,
+                requested_topics: requested.into(),
                 existing_topics,
                 new_consumers: None,
                 refresh,

@@ -52,7 +52,9 @@ See [§12](#12-divergence-from-upstream-streamnativepulsar-rs) for the consolida
 | Phase 0 | Per-message null/b64 flags preserved when unpacking batches | **done** |
 | Phase 0 | **Publishing** a protocol null value or a binary key — `Message.payload: Option<Vec<u8>>`, `PartitionKey::{Text,Bytes,Null}` | **done** |
 | **Phase 0** | **complete** | ✅ |
-| Phase 1 | `autoUpdatePartitions`, TLS client auth, `listenerName`, reader primitives, ack grouping, … | next |
+| Phase 1 | `listenerName` — `PulsarBuilder::with_listener_name`, sent on topic lookup | **done** |
+| Phase 1 | `autoUpdatePartitions` — producer and consumer both follow a topic as it grows | **done** |
+| Phase 1 | TLS client auth, reader primitives, ack grouping, … | next |
 | Phase 3 | Admin foundation: typed `AdminError` taxonomy, request plumbing, verified models | **done** |
 | Phase 3 | Admin groups: clusters, tenants, namespaces, brokers, bookies, resource groups, resource quotas (~125 ops) | **done** |
 | Phase 3 | Admin group: topic policies (88 ops, every policy typed, local and global sets) | **done** |
@@ -82,7 +84,7 @@ API change the original claim had glossed over:
 `SerializeMessage for ()` now sends a null value rather than an empty payload, which is the honest
 mapping for a type that carries no value.
 
-Test count: **50 → 237** (plus 20 doctests and 3 async-std tests). All green against Pulsar 5.0.0-M1; `cargo fmt --all
+Test count: **50 → 244** (plus 20 doctests and 3 async-std tests). All green against Pulsar 5.0.0-M1; `cargo fmt --all
 --check` and both CI clippy feature sets clean.
 
 ### Correction to §1 (wire protocol)
@@ -99,7 +101,7 @@ the scalable-topic command set (28 messages, 17 command types), deferred to Phas
 
 The Java client's ~2,160 `@Test` methods break down as: `pulsar-client` unit 704, `pulsar-client-v5`
 96, `pulsar-client-admin` 52, `pulsar-client-api-v5` 14, plus the client-facing integration suites
-that live in `pulsar-broker` — `client/api` 801 and `client/impl` 493. Rust is at 237.
+that live in `pulsar-broker` — `client/api` 801 and `client/impl` 493. Rust is at 244.
 
 Closing that as a standalone project would cost more than all the feature phases combined, and a raw
 count is a weak metric anyway (much of the Java total is the same behaviour re-run across broker
@@ -220,7 +222,7 @@ than individual fields.
 | Hashing scheme (`JavaStringHash` / `Murmur3_32Hash`) | ✅ | ❌ | ✅ | **P0** (D1) |
 | Routing: RoundRobin / SinglePartition / Custom | ✅ | 🟡 | ✅ | **P0** (D2) |
 | Message chunking (`enableChunking`, `chunkMaxMessageSize`) | ✅ | ❌ | ❌ᵍ | **P0** (D3) |
-| `autoUpdatePartitions` (+ interval) | ✅ | ❌ | ❌ | **P1** — partition count increases are never picked up; new partitions get no traffic for the process lifetime |
+| `autoUpdatePartitions` (+ interval) | ✅ | ❌ | ✅ | done — `ProducerBuilder::with_partition_refresh` / `without_partition_refresh`, 60s default as in Java; re-checks on the next send after the interval, so an idle producer costs nothing |
 | `sendTimeout` | ✅ | ❌ | ❌ | **P1** — only a per-connection `outbound_channel_size` (default 100); no per-message deadline |
 | `maxPendingMessages` / `maxPendingMessagesAcrossPartitions` | ✅ | 🟡 | 🟡 | **P1** — `block_queue_if_full` + channel depth is not an equivalent bound |
 | `initialSequenceId` | ✅ | ❌ | ❌ | **P1** — broker-side dedup cannot survive a producer restart |
@@ -245,7 +247,7 @@ than individual fields.
 | Feature | Java | pulsar-rs | Rust RDG | Prio |
 |---|:--:|:--:|:--:|:--:|
 | Chunked message reassembly | ✅ | ❌ | ❌ᵍ | **P0** (D3) |
-| `autoUpdatePartitions` | ✅ | ❌ | ❌ | **P1** — same as producer: added partitions are never consumed |
+| `autoUpdatePartitions` | ✅ | ❌ | ✅ | done — driven by the existing `with_topic_refresh` interval (30s default) |
 | `acknowledgmentGroupTime` / `maxAcknowledgmentGroupSize` | ✅ | ❌ | ❌ | **P1** — every ack is its own command; measurable throughput cost at high rates |
 | `enableBatchIndexAcknowledgment` | ✅ | ❌ | ❌ | **P1** — acking one message in a batch redelivers the whole batch |
 | `enableRetry` / retry-letter topic / `reconsumeLater` | ✅ | ❌ | ❌ | **P1** — the standard delayed-retry pattern is unavailable |
@@ -311,7 +313,7 @@ The Rust client has no schema *layer* — only a raw `proto::Schema` you fill in
 | Feature | Java | pulsar-rs | Rust RDG | Prio |
 |---|:--:|:--:|:--:|:--:|
 | TLS client-certificate auth (`AuthenticationTls`) | ✅ | ❌ | ❌ | **P1** — no `tlsCertificateFilePath` / `tlsKeyFilePath`; mTLS-authenticated clusters are unreachable |
-| `listenerName` (advertised listener) | ✅ | ❌ | ❌ | **P1** — required for Kubernetes / multi-network clusters; without it lookups return unreachable internal addresses |
+| `listenerName` (advertised listener) | ✅ | ❌ | ✅ | done — `PulsarBuilder::with_listener_name`; rides on `CommandLookupTopic` only, as in Java |
 | `proxyServiceUrl` + `ProxyProtocol` (SNI routing) | ✅ | ❌ | ❌ | P2 — `proxy_through_service_url` is *read* in `service_discovery.rs:312` but not configurable |
 | Athenz | ✅ | ❌ | ❌ | P3 |
 | SASL / Kerberos | ✅ | ❌ | ❌ | P3 |
@@ -513,9 +515,9 @@ Everything a real deployment hits within the first week.
 
 | Item | Why it's here |
 |---|---|
-| `autoUpdatePartitions` (producer + consumer) | Scaling a topic silently strands traffic |
+| ~~`autoUpdatePartitions`~~ | ✅ done — scaling a topic silently stranded traffic |
 | TLS client-certificate auth | Locks out mTLS clusters entirely |
-| `listenerName` | Locks out every Kubernetes/multi-network cluster |
+| ~~`listenerName`~~ | ✅ done — locked out every Kubernetes/multi-network cluster |
 | `Reader::has_message_available` + `startMessageIdInclusive` | The two most-requested reader primitives |
 | Ack grouping (`acknowledgmentGroupTime`, `maxAcknowledgmentGroupSize`) | Throughput |
 | Batch index acknowledgment | Prevents whole-batch redelivery |
