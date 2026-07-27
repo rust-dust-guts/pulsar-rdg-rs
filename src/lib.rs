@@ -45,7 +45,7 @@
 //!         let payload =
 //!             serde_json::to_vec(&input).map_err(|e| PulsarError::Custom(e.to_string()))?;
 //!         Ok(producer::Message {
-//!             payload,
+//!             payload: Some(payload),
 //!             ..Default::default()
 //!         })
 //!     }
@@ -290,7 +290,7 @@ mod tests {
             let payload =
                 serde_json::to_vec(input).map_err(|e| PulsarError::Custom(e.to_string()))?;
             Ok(producer::Message {
-                payload,
+                payload: Some(payload),
                 ..Default::default()
             })
         }

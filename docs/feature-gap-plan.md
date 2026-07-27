@@ -50,9 +50,9 @@ See [§12](#12-divergence-from-upstream-streamnativepulsar-rs) for the consolida
 | Phase 0 | PIP-344 `metadata_auto_creation_enabled` with capability check | **done** |
 | Phase 0 | Remaining field-level proto gaps (all non-scalable-topic messages now match 5.0) | **done** |
 | Phase 0 | Per-message null/b64 flags preserved when unpacking batches | **done** |
-| Phase 0 | **Publishing** a protocol null value or a binary key | **not done** — see below |
-| **Phase 0** | **substantially complete**, one item outstanding | ⚠️ |
-| Phase 1 | null-value + binary-key publish/consume API, `autoUpdatePartitions`, TLS client auth, `listenerName`, reader primitives, ack grouping, … | next |
+| Phase 0 | **Publishing** a protocol null value or a binary key — `Message.payload: Option<Vec<u8>>`, `PartitionKey::{Text,Bytes,Null}` | **done** |
+| **Phase 0** | **complete** | ✅ |
+| Phase 1 | `autoUpdatePartitions`, TLS client auth, `listenerName`, reader primitives, ack grouping, … | next |
 | Phase 3 | Admin foundation: typed `AdminError` taxonomy, request plumbing, verified models | **done** |
 | Phase 3 | Admin groups: clusters, tenants, namespaces, brokers, bookies, resource groups, resource quotas (~125 ops) | **done** |
 | Phase 3 | Admin group: topic policies (88 ops, every policy typed, local and global sets) | **done** |
@@ -66,19 +66,23 @@ See [§12](#12-divergence-from-upstream-streamnativepulsar-rs) for the consolida
 **Correction to an earlier completion claim.** Phase 0 originally listed
 "`null_value` / `null_partition_key` / `partition_key_b64_encoded` proto fields **+ handling**", and
 was marked complete when only the field-level work was finished — which turned out to be a no-op,
-since those fields already existed upstream. The consume side is now correct (per-message flags are
-no longer inherited from the batch envelope), but the **publish** side is not:
+since those fields already existed upstream. The consume side was fixed first (per-message flags are
+no longer inherited from the batch envelope); the **publish** side is now done too, and it needed the
+API change the original claim had glossed over:
 
-* `producer::Message` models the payload as `Vec<u8>` and the key as `Option<String>`, so it cannot
-  express "value absent" as distinct from "empty value", nor a binary key.
-* A Java consumer therefore cannot distinguish a Rust empty payload from a null one.
-* Binary keys additionally need base64 encoding *before* hashing, to match
-  `TypedMessageBuilderImpl.keyBytes` — see the note on `HashingScheme::make_hash`.
+* `producer::Message::payload` is `Option<Vec<u8>>`. `None` sends a protocol null value; `Some(vec![])`
+  sends an empty one, and the two are distinguishable on the wire, as they are in Java.
+* `partition_key` is a `PartitionKey`: `Text` for a string key, `Bytes` for a binary one — sent
+  base64-encoded with `partition_key_b64_encoded`, as Java's `keyBytes` does — and `Null` for an
+  explicitly null key, which is distinct from no key at all.
+* A binary key hashes in its **encoded** form. Java's routers hash `msg.getKey()`, already the base64
+  string for `keyBytes`, so hashing the raw bytes would route the same key to a different partition
+  than every other client — the failure mode `HashingScheme` exists to prevent.
 
-This needs an API change to `producer::Message` plus bidirectional Rust↔Java round-trip tests, so it
-is carried into Phase 1 as its own item rather than left implied.
+`SerializeMessage for ()` now sends a null value rather than an empty payload, which is the honest
+mapping for a type that carries no value.
 
-Test count: **50 → 231** (plus 20 doctests and 3 async-std tests). All green against Pulsar 5.0.0-M1; `cargo fmt --all
+Test count: **50 → 237** (plus 20 doctests and 3 async-std tests). All green against Pulsar 5.0.0-M1; `cargo fmt --all
 --check` and both CI clippy feature sets clean.
 
 ### Correction to §1 (wire protocol)
@@ -95,7 +99,7 @@ the scalable-topic command set (28 messages, 17 command types), deferred to Phas
 
 The Java client's ~2,160 `@Test` methods break down as: `pulsar-client` unit 704, `pulsar-client-v5`
 96, `pulsar-client-admin` 52, `pulsar-client-api-v5` 14, plus the client-facing integration suites
-that live in `pulsar-broker` — `client/api` 801 and `client/impl` 493. Rust is at 231.
+that live in `pulsar-broker` — `client/api` 801 and `client/impl` 493. Rust is at 237.
 
 Closing that as a standalone project would cost more than all the feature phases combined, and a raw
 count is a weak metric anyway (much of the Java total is the same behaviour re-run across broker

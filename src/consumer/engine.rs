@@ -21,7 +21,7 @@ use crate::{
         proto::{command_subscribe::SubType, MessageIdData},
         Message as RawMessage,
     },
-    producer::Message,
+    producer::{Message, PartitionKey},
     proto,
     proto::{BaseCommand, CommandCloseConsumer, CommandMessage},
     retry_op::retry_subscribe_consumer,
@@ -582,10 +582,17 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
                                 )
                             }
                         });
+                    // Re-publishing a consumed message: carry the key across in the
+                    // form it arrived in, so a binary key stays binary.
+                    let partition_key = PartitionKey::from_metadata(
+                        metadata.partition_key,
+                        metadata.partition_key_b64_encoded,
+                        metadata.null_partition_key,
+                    );
                     let message = Message {
-                        payload: data,
+                        payload: (!metadata.null_value.unwrap_or(false)).then_some(data),
                         properties,
-                        partition_key: metadata.partition_key,
+                        partition_key,
                         ordering_key: metadata.ordering_key,
                         event_time: metadata.event_time,
                         ..Default::default()

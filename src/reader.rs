@@ -208,7 +208,7 @@ mod tests {
         fn serialize_message(input: Self) -> Result<producer::Message, Error> {
             let payload = serde_json::to_vec(&input).map_err(|e| Error::Custom(e.to_string()))?;
             Ok(producer::Message {
-                payload,
+                payload: Some(payload),
                 ..Default::default()
             })
         }

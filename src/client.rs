@@ -63,9 +63,13 @@ impl SerializeMessage for producer::Message {
 }
 
 impl SerializeMessage for () {
+    /// The unit type carries no value, so it sends a protocol **null value**
+    /// rather than an empty payload — the same distinction Java draws between
+    /// `value(null)` and `value(new byte[0])`.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn serialize_message(_input: Self) -> Result<producer::Message, Error> {
         Ok(producer::Message {
+            payload: None,
             ..Default::default()
         })
     }
@@ -75,7 +79,7 @@ impl SerializeMessage for &[u8] {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn serialize_message(input: Self) -> Result<producer::Message, Error> {
         Ok(producer::Message {
-            payload: input.to_vec(),
+            payload: Some(input.to_vec()),
             ..Default::default()
         })
     }
@@ -85,7 +89,7 @@ impl SerializeMessage for Vec<u8> {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn serialize_message(input: Self) -> Result<producer::Message, Error> {
         Ok(producer::Message {
-            payload: input,
+            payload: Some(input),
             ..Default::default()
         })
     }
@@ -96,7 +100,7 @@ impl SerializeMessage for String {
     fn serialize_message(input: Self) -> Result<producer::Message, Error> {
         let payload = input.into_bytes();
         Ok(producer::Message {
-            payload,
+            payload: Some(payload),
             ..Default::default()
         })
     }
@@ -107,7 +111,7 @@ impl SerializeMessage for &String {
     fn serialize_message(input: Self) -> Result<producer::Message, Error> {
         let payload = input.as_bytes().to_vec();
         Ok(producer::Message {
-            payload,
+            payload: Some(payload),
             ..Default::default()
         })
     }
@@ -118,7 +122,7 @@ impl SerializeMessage for &str {
     fn serialize_message(input: Self) -> Result<producer::Message, Error> {
         let payload = input.as_bytes().to_vec();
         Ok(producer::Message {
-            payload,
+            payload: Some(payload),
             ..Default::default()
         })
     }

@@ -1,5 +1,6 @@
 //! Message publication
 use std::{
+    borrow::Cow,
     collections::{btree_map::Entry, BTreeMap, HashMap, VecDeque},
     io::Write,
     num::NonZeroUsize,
@@ -10,6 +11,8 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 use futures::{
     channel::{mpsc, oneshot},
@@ -61,6 +64,87 @@ impl Future for SendFuture {
     }
 }
 
+/// A message's partition key.
+///
+/// Mirrors Java's `TypedMessageBuilder::key` / `keyBytes`, which are two spellings
+/// of the same wire field: the key always travels as text in
+/// `MessageMetadata.partition_key`, and a binary key is base64-encoded with
+/// `partition_key_b64_encoded` set so the consumer can recover the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartitionKey {
+    /// A text key, sent and hashed as-is.
+    Text(String),
+    /// A binary key.
+    ///
+    /// Sent base64-encoded, and **hashed in that encoded form** — Java's routers
+    /// hash `msg.getKey()`, which for `keyBytes` is already the encoded string. A
+    /// Rust producer that hashed the raw bytes would route the same key to a
+    /// different partition than every other client.
+    Bytes(Vec<u8>),
+    /// An explicitly null key, as Java's `key(null)` / `keyBytes(null)`.
+    ///
+    /// Distinct from `partition_key: None`, which means no key was set at all: this
+    /// sets `null_partition_key` on the wire, which a consumer can observe.
+    Null,
+}
+
+impl PartitionKey {
+    /// The text form the broker stores and the routers hash.
+    ///
+    /// `None` for [`PartitionKey::Null`], which carries no key to route on.
+    pub fn routing_key(&self) -> Option<Cow<'_, str>> {
+        match self {
+            PartitionKey::Text(key) => Some(Cow::Borrowed(key)),
+            PartitionKey::Bytes(key) => Some(Cow::Owned(BASE64.encode(key))),
+            PartitionKey::Null => None,
+        }
+    }
+}
+
+impl PartitionKey {
+    /// Rebuilds a key from the metadata of a message that was received.
+    ///
+    /// Used by the retry-letter and dead-letter paths, which re-publish a consumed
+    /// message and must not silently turn a binary key back into text.
+    pub(crate) fn from_metadata(
+        key: Option<String>,
+        b64_encoded: Option<bool>,
+        null_key: Option<bool>,
+    ) -> Option<Self> {
+        match (key, b64_encoded) {
+            // A key the producer sent as bytes; recover them. If it somehow is not
+            // valid base64, keep the text rather than losing the key entirely.
+            (Some(key), Some(true)) => Some(
+                BASE64
+                    .decode(key.as_bytes())
+                    .map(PartitionKey::Bytes)
+                    .unwrap_or(PartitionKey::Text(key)),
+            ),
+            (Some(key), _) => Some(PartitionKey::Text(key)),
+            (None, _) if null_key.unwrap_or(false) => Some(PartitionKey::Null),
+            (None, _) => None,
+        }
+    }
+}
+
+impl From<String> for PartitionKey {
+    fn from(key: String) -> Self {
+        PartitionKey::Text(key)
+    }
+}
+
+impl From<&str> for PartitionKey {
+    fn from(key: &str) -> Self {
+        PartitionKey::Text(key.to_string())
+    }
+}
+
+impl From<Vec<u8>> for PartitionKey {
+    fn from(key: Vec<u8>) -> Self {
+        PartitionKey::Bytes(key)
+    }
+}
+
 /// message data that will be sent on a topic
 ///
 /// generated from the [SerializeMessage] trait or [MessageBuilder]
@@ -69,12 +153,16 @@ impl Future for SendFuture {
 /// compression and encryption should be handled by the producer
 #[derive(Debug, Clone, Default)]
 pub struct Message {
-    /// serialized data
-    pub payload: Vec<u8>,
+    /// Serialized data.
+    ///
+    /// `None` sends a protocol **null value**, which a Java consumer sees as a
+    /// null rather than as an empty payload. `Some(vec![])` is an empty value,
+    /// and the two are distinguishable on the wire.
+    pub payload: Option<Vec<u8>>,
     /// user defined properties
     pub properties: HashMap<String, String>,
-    /// key to decide partition for the message
-    pub partition_key: ::std::option::Option<String>,
+    /// Key deciding the message's partition. Text or binary; see [`PartitionKey`].
+    pub partition_key: ::std::option::Option<PartitionKey>,
     /// key to decide partition for the message
     pub ordering_key: ::std::option::Option<Vec<u8>>,
     /// Override namespace's replication
@@ -94,6 +182,13 @@ pub struct Message {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProducerMessage {
     pub payload: Vec<u8>,
+    /// The value is absent, not empty. A null value travels as an empty payload
+    /// plus this flag, so `payload` stays a plain `Vec<u8>` internally.
+    pub null_value: ::std::option::Option<bool>,
+    /// The key in `partition_key` is base64-encoded binary.
+    pub partition_key_b64_encoded: ::std::option::Option<bool>,
+    /// The key was explicitly set to null, as distinct from never set.
+    pub null_partition_key: ::std::option::Option<bool>,
     pub properties: HashMap<String, String>,
     ///key to decide partition for the msg
     pub partition_key: ::std::option::Option<String>,
@@ -124,10 +219,22 @@ pub(crate) struct ProducerMessage {
 impl From<Message> for ProducerMessage {
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     fn from(m: Message) -> Self {
+        // The wire carries a null value as an empty payload plus a flag, and a
+        // binary key as base64 text plus a flag — so both collapse here.
+        let null_value = m.payload.is_none().then_some(true);
+        let (partition_key, partition_key_b64_encoded, null_partition_key) = match m.partition_key {
+            Some(PartitionKey::Text(key)) => (Some(key), None, None),
+            Some(PartitionKey::Bytes(key)) => (Some(BASE64.encode(key)), Some(true), None),
+            Some(PartitionKey::Null) => (None, None, Some(true)),
+            None => (None, None, None),
+        };
         ProducerMessage {
-            payload: m.payload,
+            payload: m.payload.unwrap_or_default(),
+            null_value,
+            partition_key,
+            partition_key_b64_encoded,
+            null_partition_key,
             properties: m.properties,
-            partition_key: m.partition_key,
             ordering_key: m.ordering_key,
             replicate_to: m.replicate_to,
             event_time: m.event_time,
@@ -579,12 +686,19 @@ impl<Exe: Executor> PartitionedProducer<Exe> {
         // This applies to `None` too, which behaves as `RoundRobin` — that is the
         // default path, so a key being ignored there would break ordering for
         // every producer that never sets a policy.
+        // `routing_key` is the *wire* form: a binary key hashes base64-encoded,
+        // matching Java, whose routers hash `msg.getKey()` — already the encoded
+        // string for `keyBytes`. Hashing the raw bytes would send the same key to a
+        // different partition than every other client.
         let hash_routed_key = match &self.options.routing_policy {
             Some(RoutingPolicy::Custom(_)) => None,
-            _ => message.partition_key.as_deref(),
+            _ => message
+                .partition_key
+                .as_ref()
+                .and_then(PartitionKey::routing_key),
         };
         if let Some(partition_key) = hash_routed_key {
-            return self.route_by_key(partition_key);
+            return self.route_by_key(&partition_key);
         }
 
         match &self.options.routing_policy {
@@ -786,6 +900,9 @@ impl<Exe: Executor> TopicProducer<Exe> {
                     metadata: proto::SingleMessageMetadata {
                         properties,
                         partition_key: message.partition_key,
+                        partition_key_b64_encoded: message.partition_key_b64_encoded,
+                        null_partition_key: message.null_partition_key,
+                        null_value: message.null_value,
                         ordering_key: message.ordering_key,
                         payload_size: message.payload.len() as i32,
                         event_time: message.event_time,
@@ -1386,7 +1503,7 @@ async fn message_send_loop<Exe>(
 pub struct MessageBuilder<'a, T, Exe: Executor> {
     producer: &'a mut Producer<Exe>,
     properties: HashMap<String, String>,
-    partition_key: Option<String>,
+    partition_key: Option<PartitionKey>,
     ordering_key: Option<Vec<u8>>,
     deliver_at_time: Option<i64>,
     event_time: Option<u64>,
@@ -1424,9 +1541,12 @@ impl<'a, T, Exe: Executor> MessageBuilder<'a, T, Exe> {
         }
     }
 
-    /// sets the message's partition key
+    /// Sets the message's partition key.
+    ///
+    /// Accepts a `String`, `&str` or `Vec<u8>`; a byte key is sent base64-encoded
+    /// and hashed in that form, matching Java's `keyBytes`. See [`PartitionKey`].
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub fn with_partition_key<S: Into<String>>(mut self, partition_key: S) -> Self {
+    pub fn with_partition_key<K: Into<PartitionKey>>(mut self, partition_key: K) -> Self {
         self.partition_key = Some(partition_key.into());
         self
     }
@@ -1443,7 +1563,7 @@ impl<'a, T, Exe: Executor> MessageBuilder<'a, T, Exe> {
     /// this is the same as `with_partition_key`, this method is added for
     /// more consistency with other clients
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub fn with_key<S: Into<String>>(mut self, partition_key: S) -> Self {
+    pub fn with_key<K: Into<PartitionKey>>(mut self, partition_key: K) -> Self {
         self.partition_key = Some(partition_key.into());
         self
     }
@@ -1551,6 +1671,120 @@ mod tests {
         }
     }
 
+    /// A null value is distinct from an empty one, on the wire.
+    ///
+    /// Java draws the same line between `value(null)` and `value(new byte[0])`, and a
+    /// Java consumer reads `null_value` to tell them apart. Modelling the payload as
+    /// a plain `Vec<u8>` made the two indistinguishable.
+    #[test]
+    fn a_null_value_is_not_an_empty_value() {
+        let null: ProducerMessage = Message {
+            payload: None,
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(null.null_value, Some(true));
+        assert!(null.payload.is_empty(), "a null value carries no bytes");
+
+        let empty: ProducerMessage = Message {
+            payload: Some(Vec::new()),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(empty.null_value, None, "an empty value is not a null value");
+        assert!(empty.payload.is_empty());
+    }
+
+    /// A binary key travels base64-encoded with the flag set.
+    #[test]
+    fn a_binary_key_is_base64_encoded_on_the_wire() {
+        let m: ProducerMessage = Message {
+            partition_key: Some(PartitionKey::Bytes(vec![0, 1, 255])),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(m.partition_key.as_deref(), Some("AAH/"));
+        assert_eq!(m.partition_key_b64_encoded, Some(true));
+        assert_eq!(m.null_partition_key, None);
+    }
+
+    /// An explicitly null key is distinct from no key at all.
+    #[test]
+    fn an_explicitly_null_key_is_not_an_absent_key() {
+        let null: ProducerMessage = Message {
+            partition_key: Some(PartitionKey::Null),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(null.null_partition_key, Some(true));
+        assert_eq!(null.partition_key, None);
+
+        let absent: ProducerMessage = Message {
+            partition_key: None,
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(absent.null_partition_key, None);
+        assert_eq!(absent.partition_key, None);
+    }
+
+    /// A binary key hashes in its **encoded** form.
+    ///
+    /// Java's routers hash `msg.getKey()`, which for `keyBytes` is already the
+    /// base64 string. Hashing the raw bytes would put the same key on a different
+    /// partition than every other client — the exact class of bug `HashingScheme`
+    /// was introduced to fix.
+    #[test]
+    fn a_binary_key_hashes_as_its_base64_text() {
+        let raw = vec![0u8, 1, 255];
+        let key = PartitionKey::Bytes(raw.clone());
+        assert_eq!(key.routing_key().as_deref(), Some("AAH/"));
+
+        let partitions = NonZeroUsize::new(7).unwrap();
+        for scheme in [HashingScheme::JavaStringHash, HashingScheme::Murmur3_32Hash] {
+            let encoded = RoutingPolicy::compute_partition_index_for_key(
+                key.routing_key().unwrap().as_ref(),
+                partitions,
+                scheme,
+            );
+            // What the raw bytes would have hashed to, had we not encoded first.
+            let raw_as_text = String::from_utf8_lossy(&raw).to_string();
+            let unencoded =
+                RoutingPolicy::compute_partition_index_for_key(&raw_as_text, partitions, scheme);
+            assert_ne!(
+                encoded, unencoded,
+                "{scheme:?}: this key hashes the same either way, so it cannot show \
+                 that the encoded form is used — pick a different fixture"
+            );
+        }
+    }
+
+    /// A round-trip through message metadata preserves the key's form.
+    #[test]
+    fn a_key_survives_a_round_trip_through_metadata() {
+        for original in [
+            PartitionKey::Text("plain".to_string()),
+            PartitionKey::Bytes(vec![0, 1, 255]),
+            PartitionKey::Null,
+        ] {
+            let sent: ProducerMessage = Message {
+                partition_key: Some(original.clone()),
+                ..Default::default()
+            }
+            .into();
+            assert_eq!(
+                PartitionKey::from_metadata(
+                    sent.partition_key,
+                    sent.partition_key_b64_encoded,
+                    sent.null_partition_key,
+                ),
+                Some(original.clone()),
+                "{original:?} did not survive the round trip"
+            );
+        }
+        assert_eq!(PartitionKey::from_metadata(None, None, None), None);
+    }
+
     #[test]
     fn message_converts_into_producer_message() {
         let mut props = HashMap::new();
@@ -1558,7 +1792,7 @@ mod tests {
         props.insert("b".to_string(), "2".to_string());
 
         let m = Message {
-            payload: b"hello".to_vec(),
+            payload: Some(b"hello".to_vec()),
             properties: props.clone(),
             partition_key: Some("key".into()),
             ordering_key: Some(vec![1, 2, 3]),
@@ -1570,9 +1804,18 @@ mod tests {
 
         let pm: ProducerMessage = m.clone().into();
 
-        assert_eq!(pm.payload, m.payload);
+        assert_eq!(pm.payload, m.payload.clone().unwrap());
+        assert!(
+            pm.null_value.is_none(),
+            "a present payload is not a null value"
+        );
         assert_eq!(pm.properties, m.properties);
-        assert_eq!(pm.partition_key, m.partition_key);
+        assert_eq!(pm.partition_key.as_deref(), Some("key"));
+        assert!(
+            pm.partition_key_b64_encoded.is_none(),
+            "a text key is not base64"
+        );
+        assert!(pm.null_partition_key.is_none());
         assert_eq!(pm.ordering_key, m.ordering_key);
         assert_eq!(pm.replicate_to, m.replicate_to);
         assert_eq!(pm.event_time, m.event_time);
@@ -1703,8 +1946,8 @@ mod tests {
         // test round robin with key
         let key = "test";
         let message = Message {
-            payload: "test".to_string().into(),
-            partition_key: Some(key.to_string()),
+            payload: Some("test".into()),
+            partition_key: Some(key.into()),
             ..Default::default()
         };
         let CommandSendReceipt { producer_id, .. } = producer
@@ -1715,8 +1958,8 @@ mod tests {
             .unwrap();
         for _ in 1..100 {
             let message = Message {
-                payload: "test".to_string().into(),
-                partition_key: Some(key.to_string()),
+                payload: Some("test".into()),
+                partition_key: Some(key.into()),
                 ..Default::default()
             };
 
@@ -1757,8 +2000,8 @@ mod tests {
 
         let key = "test";
         let message = Message {
-            payload: "test".to_string().into(),
-            partition_key: Some(key.to_string()),
+            payload: Some("test".into()),
+            partition_key: Some(key.into()),
             ..Default::default()
         };
 
@@ -1770,8 +2013,8 @@ mod tests {
             .unwrap();
         for _ in 1..100 {
             let message = Message {
-                payload: "test".to_string().into(),
-                partition_key: Some(key.to_string()),
+                payload: Some("test".into()),
+                partition_key: Some(key.into()),
                 ..Default::default()
             };
 
@@ -2007,6 +2250,134 @@ mod tests {
         }
     }
 
+    /// A null value and a binary key survive a publish/consume round trip.
+    ///
+    /// This is the Phase 0 exit criterion: before this, `producer::Message` modelled
+    /// the payload as `Vec<u8>` and the key as `Option<String>`, so neither could be
+    /// expressed at all. The assertions are on the *metadata flags*, because that is
+    /// what a Java consumer reads to tell a null value from an empty one.
+    #[tokio::test]
+    #[cfg_attr(not(feature = "admin-api"), ignore)]
+    async fn null_values_and_binary_keys_round_trip() {
+        use crate::{
+            consumer::{ConsumerOptions, InitialPosition},
+            message::proto::command_subscribe::SubType,
+            Consumer,
+        };
+
+        let _result = log::set_logger(&TEST_LOGGER);
+        log::set_max_level(LevelFilter::Debug);
+
+        let pulsar: Pulsar<_> = Pulsar::builder(test_utils::broker_url(), TokioExecutor)
+            .build()
+            .await
+            .unwrap();
+        let topic = format!(
+            "persistent://public/default/nullkey-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
+
+        let mut consumer: Consumer<Vec<u8>, _> = pulsar
+            .consumer()
+            .with_topic(&topic)
+            .with_subscription("round-trip")
+            .with_subscription_type(SubType::Exclusive)
+            .with_options(
+                ConsumerOptions::default().with_initial_position(InitialPosition::Earliest),
+            )
+            .build()
+            .await
+            .unwrap();
+
+        let mut producer = pulsar.producer().with_topic(&topic).build().await.unwrap();
+        let binary_key = vec![0u8, 1, 255, 0x7f];
+
+        // 1: a null value. 2: an empty value, which must NOT look null.
+        // 3: a binary key. 4: an explicitly null key.
+        for message in [
+            Message {
+                payload: None,
+                ..Default::default()
+            },
+            Message {
+                payload: Some(Vec::new()),
+                ..Default::default()
+            },
+            Message {
+                payload: Some(b"keyed".to_vec()),
+                partition_key: Some(PartitionKey::Bytes(binary_key.clone())),
+                ..Default::default()
+            },
+            Message {
+                payload: Some(b"nullkey".to_vec()),
+                partition_key: Some(PartitionKey::Null),
+                ..Default::default()
+            },
+        ] {
+            producer
+                .send_non_blocking(message)
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+
+        let mut received = Vec::new();
+        while received.len() < 4 {
+            let msg = consumer.next().await.unwrap().unwrap();
+            consumer.ack(&msg).await.unwrap();
+            received.push(msg);
+        }
+
+        let null_value = received[0].metadata();
+        assert_eq!(
+            null_value.null_value,
+            Some(true),
+            "a null value did not set null_value"
+        );
+
+        let empty_value = received[1].metadata();
+        assert_ne!(
+            empty_value.null_value,
+            Some(true),
+            "an empty value was published as a null one — the two must stay distinct"
+        );
+
+        let keyed = received[2].metadata();
+        assert_eq!(
+            keyed.partition_key_b64_encoded,
+            Some(true),
+            "a binary key did not set partition_key_b64_encoded"
+        );
+        assert_eq!(
+            keyed.partition_key.as_deref(),
+            Some(BASE64.encode(&binary_key).as_str()),
+            "the binary key was not base64-encoded on the wire"
+        );
+        // And it decodes back to exactly the bytes that were sent.
+        assert_eq!(
+            PartitionKey::from_metadata(
+                keyed.partition_key.clone(),
+                keyed.partition_key_b64_encoded,
+                keyed.null_partition_key,
+            ),
+            Some(PartitionKey::Bytes(binary_key)),
+            "the binary key did not survive the round trip"
+        );
+
+        let null_key = received[3].metadata();
+        assert_eq!(
+            null_key.null_partition_key,
+            Some(true),
+            "an explicitly null key did not set null_partition_key"
+        );
+        assert_eq!(null_key.partition_key, None);
+
+        producer.close().await.unwrap();
+    }
     #[tokio::test]
     async fn test_custom_routing_policy() {
         let _result = log::set_logger(&TEST_LOGGER);
@@ -2033,8 +2404,8 @@ mod tests {
 
         let key = "test";
         let message = Message {
-            payload: "test".to_string().into(),
-            partition_key: Some(key.to_string()),
+            payload: Some("test".into()),
+            partition_key: Some(key.into()),
             ..Default::default()
         };
 
@@ -2046,8 +2417,8 @@ mod tests {
             .unwrap();
         for _ in 1..100 {
             let message = Message {
-                payload: "test".to_string().into(),
-                partition_key: Some(key.to_string()),
+                payload: Some("test".into()),
+                partition_key: Some(key.into()),
                 ..Default::default()
             };
 

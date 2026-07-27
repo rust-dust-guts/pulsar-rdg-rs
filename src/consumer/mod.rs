@@ -451,6 +451,7 @@ mod tests {
         feature = "tokio-rustls-runtime-ring"
     ))]
     use crate::executor::TokioExecutor;
+    use crate::producer::PartitionKey;
     use crate::{
         consumer::initial_position::InitialPosition, producer, proto, tests::TEST_LOGGER,
         Error as PulsarError, Payload, Pulsar, SerializeMessage,
@@ -474,7 +475,7 @@ mod tests {
         fn serialize_message(input: Self) -> Result<producer::Message, Error> {
             let payload = serde_json::to_vec(&input).map_err(|e| Error::Custom(e.to_string()))?;
             Ok(producer::Message {
-                payload,
+                payload: Some(payload),
                 ..Default::default()
             })
         }
@@ -866,7 +867,10 @@ mod tests {
 
         let mut message = <&TestData>::serialize_message(&message_data).unwrap();
         message.properties = message_metadata.properties.clone();
-        message.partition_key = message_metadata.partition_key.clone();
+        message.partition_key = message_metadata
+            .partition_key
+            .clone()
+            .map(PartitionKey::Text);
         message.ordering_key = message_metadata.ordering_key.clone();
         message.event_time = message_metadata.event_time;
 
@@ -1072,7 +1076,7 @@ mod tests {
             .map(|(data, metadata)| {
                 let mut message = <&TestData>::serialize_message(data).unwrap();
                 message.properties = metadata.properties.clone();
-                message.partition_key = metadata.partition_key.clone();
+                message.partition_key = metadata.partition_key.clone().map(PartitionKey::Text);
                 message.ordering_key = metadata.ordering_key.clone();
                 message.event_time = metadata.event_time;
                 message
@@ -1345,7 +1349,7 @@ mod tests {
                 let payload =
                     serde_json::to_vec(&input).map_err(|e| PulsarError::Custom(e.to_string()))?;
                 Ok(producer::Message {
-                    payload,
+                    payload: Some(payload),
                     ..Default::default()
                 })
             }
@@ -1463,7 +1467,7 @@ mod tests {
             let payload =
                 serde_json::to_vec(&input).map_err(|e| PulsarError::Custom(e.to_string()))?;
             Ok(producer::Message {
-                payload,
+                payload: Some(payload),
                 ..Default::default()
             })
         }
@@ -1705,7 +1709,7 @@ mod tests {
                 let payload =
                     serde_json::to_vec(&input).map_err(|e| PulsarError::Custom(e.to_string()))?;
                 Ok(producer::Message {
-                    payload,
+                    payload: Some(payload),
                     schema_version: Some(CUSTOM_SCHEMA_VERSION.to_vec()),
                     ..Default::default()
                 })

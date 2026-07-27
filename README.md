@@ -101,6 +101,25 @@ ordering is not preserved across a mixed-version fleet.
 Upgrade all producers for a given topic together, or drain the topic before switching. See
 [the migration note](docs/feature-gap-plan.md#migrating-partition-routing-from-6x) for details.
 
+### Message payload and key source breaks
+
+`producer::Message` can now express what the protocol has always allowed:
+
+| Was | Now | Why |
+|---|---|---|
+| `payload: Vec<u8>` | `payload: Option<Vec<u8>>` | `None` sends a protocol **null value**; `Some(vec![])` sends an empty one. A Java consumer could not tell the two apart before |
+| `partition_key: Option<String>` | `partition_key: Option<PartitionKey>` | `Text` for a string key, `Bytes` for a binary one (base64-encoded on the wire, as Java's `keyBytes`), `Null` for an explicitly null key |
+
+`with_partition_key` and `with_key` take anything that converts into a `PartitionKey`, so existing
+`&str` and `String` calls compile unchanged. Struct literals need `payload: Some(bytes)`.
+
+One behaviour change to be aware of: **`producer.send(())` now sends a null value** rather than an
+empty payload. The unit type carries no value, so that is the honest mapping — but if you were using
+`()` to mean "empty", send `Vec::new()` instead.
+
+A binary key is hashed in its base64 form, matching Java. Sending the same key from a Java and a Rust
+producer therefore lands on the same partition.
+
 ### Admin API source breaks
 
 `AdminClient`'s flat methods moved onto groups (`admin.namespaces()`, `admin.topics()`, …) because

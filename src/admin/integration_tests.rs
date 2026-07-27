@@ -5409,7 +5409,7 @@ async fn peeked_messages_carry_their_properties() {
         let mut producer = pulsar.producer().with_topic(&topic).build().await.unwrap();
         producer
             .send_non_blocking(crate::producer::Message {
-                payload: b"hello".to_vec(),
+                payload: Some(b"hello".to_vec()),
                 properties: [
                     ("colour".to_string(), "green".to_string()),
                     ("size".to_string(), "42".to_string()),
