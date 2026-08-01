@@ -41,6 +41,12 @@ pub struct TopicConsumer<T: DeserializeMessage, Exe: Executor> {
     pub(crate) dead_letter_policy: Option<DeadLetterPolicy>,
     pub(super) last_message_received: Option<DateTime<Utc>>,
     pub(super) messages_received: u64,
+    /// Id of the last message handed to the caller.
+    ///
+    /// `has_message_available` compares this against the broker's last id; before
+    /// anything has been read there is nothing to compare, so it falls back to the
+    /// configured start position.
+    pub(super) last_dequeued_message_id: Option<MessageIdData>,
 }
 
 impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
@@ -142,6 +148,7 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
             dead_letter_policy,
             last_message_received: None,
             messages_received: 0,
+            last_dequeued_message_id: None,
         })
     }
 
@@ -271,6 +278,73 @@ impl<T: DeserializeMessage, Exe: Executor> TopicConsumer<T, Exe> {
         Ok(())
     }
 
+    /// Whether the topic holds a message this consumer has not read yet.
+    ///
+    /// This is the "read to the end of the topic, then stop" primitive: a reader
+    /// loop cannot otherwise tell an empty moment from the end of the backlog,
+    /// because the stream simply blocks in both cases.
+    ///
+    /// It asks the broker for the topic's last message id and compares it with
+    /// this consumer's position — the last message handed to the caller, or the
+    /// configured start position when nothing has been read yet. An entry id of
+    /// `-1` is the broker's way of saying the topic is empty.
+    ///
+    /// Java's `hasMessageAvailable` additionally consults the mark-delete position
+    /// to stay correct after a seek *by timestamp*, which this does not model;
+    /// after such a seek the answer can be conservative until the first message is
+    /// read.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn has_message_available(&mut self) -> Result<bool, Error> {
+        // A partly-read batch is the one case position alone cannot answer: every
+        // message in a batch shares its entry, so the last id the broker reports
+        // equals the one just delivered while the rest of the batch is still
+        // queued. Java sidesteps this by checking its incoming queue first; this
+        // checks the batch the last delivered message came from, and needs no
+        // round trip either.
+        if let Some(dequeued) = self.last_dequeued_message_id.as_ref() {
+            if let (Some(index), Some(size)) = (dequeued.batch_index, dequeued.batch_size) {
+                if index + 1 < size {
+                    return Ok(true);
+                }
+            }
+        }
+
+        let last = self.get_last_message_id().await?;
+        // The broker reports an empty topic as entry -1. The field is `uint64` on
+        // the wire, so that arrives as `u64::MAX`; reading it as signed is the
+        // honest interpretation, and without this an empty topic compares as
+        // having the largest possible position and looks full.
+        if (last.entry_id as i64) < 0 {
+            return Ok(false);
+        }
+
+        let (position, inclusive) = match self.last_dequeued_message_id.as_ref() {
+            // Already reading: the next message is anything strictly after the one
+            // just delivered.
+            Some(dequeued) => (Some(dequeued), false),
+            // Nothing read yet, so the start position decides, and whether it
+            // counts as already-consumed is exactly `start_message_id_inclusive`.
+            None => (
+                self.config.options.start_message_id.as_ref(),
+                self.config.options.start_message_id_inclusive,
+            ),
+        };
+
+        let Some(position) = position else {
+            // No start id and nothing read: any message at all is available, and
+            // the empty-topic case was already ruled out above.
+            return Ok(true);
+        };
+
+        let ordering =
+            (last.ledger_id, last.entry_id).cmp(&(position.ledger_id, position.entry_id));
+        Ok(match ordering {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Equal => inclusive,
+            std::cmp::Ordering::Less => false,
+        })
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn get_last_message_id(&mut self) -> Result<MessageIdData, Error> {
         let consumer_id = self.consumer_id;
@@ -325,6 +399,7 @@ impl<T: DeserializeMessage, Exe: Executor> Stream for TopicConsumer<T, Exe> {
             Poll::Ready(Some(Ok((id, payload)))) => {
                 self.last_message_received = Some(Utc::now());
                 self.messages_received += 1;
+                self.last_dequeued_message_id = Some(id.clone());
                 Poll::Ready(Some(Ok(self.create_message(id, payload))))
             }
             Poll::Ready(Some(Err(e))) => {

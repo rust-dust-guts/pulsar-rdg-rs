@@ -54,7 +54,17 @@ See [§12](#12-divergence-from-upstream-streamnativepulsar-rs) for the consolida
 | **Phase 0** | **complete** | ✅ |
 | Phase 1 | `listenerName` — `PulsarBuilder::with_listener_name`, sent on topic lookup | **done** |
 | Phase 1 | `autoUpdatePartitions` — producer and consumer both follow a topic as it grows | **done** |
-| Phase 1 | TLS client auth, reader primitives, ack grouping, … | next |
+| Phase 1 | TLS client-certificate auth — `with_client_identity`, all four TLS backends | **done** |
+| Phase 1 | Reader primitives — `has_message_available`, `start_message_id_inclusive` | **done** |
+| Review | Topic lookup now honours `operation_timeout`; it retried `ServiceNotReady` for ever, so a condition the broker would never resolve hung silently | **done** |
+| Review | Suite flakiness traced to its causes and fixed one by one — stub-server keep-alive, a namespace-isolation policy walking every namespace in the instance, lazily created system topics, bundle-delete fencing, a `u16` topic-name space, and broker contention; the serial configuration CI gates on runs clean | **done** |
+| Review | `cargo test` with default features did not compile — admin-using tests carried `cfg_attr(..., ignore)`, which skips at run time but still builds | **done** |
+| Review | mTLS broker added to CI; `with_client_identity` and all four TLS backends had no CI coverage, the tests silently skipped | **done** |
+| Review | Namespace fixtures wait for the `__change_events` policy topic before handing over; creating a topic in a brand-new namespace could 500 | **done** |
+| Review | Test parallelism capped at 4 in `.cargo/config.toml` — one thread per core overran the shared broker | **done** |
+| Review | Test topic leakage closed: a run left 79 topics behind, now none — a broker holding thousands was itself a source of failures | **done** |
+| Review | `Reader` re-exported at the crate root, alongside `Consumer` and `Producer` | **done** |
+| Phase 1 | Ack grouping, batch index ack, `KeySharedPolicy`, retry-letter/DLQ, … | next |
 | Phase 3 | Admin foundation: typed `AdminError` taxonomy, request plumbing, verified models | **done** |
 | Phase 3 | Admin groups: clusters, tenants, namespaces, brokers, bookies, resource groups, resource quotas (~125 ops) | **done** |
 | Phase 3 | Admin group: topic policies (88 ops, every policy typed, local and global sets) | **done** |
@@ -84,7 +94,7 @@ API change the original claim had glossed over:
 `SerializeMessage for ()` now sends a null value rather than an empty payload, which is the honest
 mapping for a type that carries no value.
 
-Test count: **50 → 244** (plus 20 doctests and 3 async-std tests). All green against Pulsar 5.0.0-M1; `cargo fmt --all
+Test count: **50 → 254** (plus 21 doctests and 3 async-std tests). All green against Pulsar 5.0.0-M1; `cargo fmt --all
 --check` and both CI clippy feature sets clean.
 
 ### Correction to §1 (wire protocol)
@@ -101,7 +111,7 @@ the scalable-topic command set (28 messages, 17 command types), deferred to Phas
 
 The Java client's ~2,160 `@Test` methods break down as: `pulsar-client` unit 704, `pulsar-client-v5`
 96, `pulsar-client-admin` 52, `pulsar-client-api-v5` 14, plus the client-facing integration suites
-that live in `pulsar-broker` — `client/api` 801 and `client/impl` 493. Rust is at 244.
+that live in `pulsar-broker` — `client/api` 801 and `client/impl` 493. Rust is at 254.
 
 Closing that as a standalone project would cost more than all the feature phases combined, and a raw
 count is a weak metric anyway (much of the Java total is the same behaviour re-run across broker
@@ -156,6 +166,9 @@ Pulsar's `Murmur3_32Hash` — the sole defect was the missing `& 0x7FFFFFFF`, wh
 50 of 100** sample keys. The `JavaStringHash` default was simply absent, so *every* key diverged from
 a default-configured Java producer.
 
+Both hashing schemes are now implemented, `JavaStringHash` is the default as in Java, and the
+`scripts/gen_java_hash_vectors.sh` golden vectors pin the agreement byte-for-byte.
+
 ### D2 — `RoutingPolicy::Single` ignores the partition key · **P0** — ✅ FIXED
 
 `choose_partition` returned a fixed producer for `Single`, discarding `message.partition_key`. Java's
@@ -168,12 +181,17 @@ affected more users than `Single` did. Both now route through the shared `route_
 
 ### D3 — Chunked messages are delivered as raw fragments · **P0**
 
-Zero occurrences of `chunk` anywhere in `src/`. `MessageMetadata` in the fork's proto does carry
+At the time of this analysis, zero occurrences of `chunk` anywhere in `src/`. `MessageMetadata` in the fork's proto does carry
 `uuid`/`chunk_id`/`num_chunks_from_msg`/`total_chunk_msg_size`, and the broker will happily dispatch
 chunks to a Rust consumer. The consumer has no reassembly path, so each fragment surfaces as an
 independent message with a truncated payload. Any topic written by a chunking Java producer is
 **silently corrupted on read**. Until reassembly exists, the consumer should at minimum detect
 `num_chunks_from_msg > 1` and error rather than hand back a fragment.
+
+That guard is now in place ([`src/consumer/engine.rs`](../src/consumer/engine.rs)): a chunk is
+rejected rather than delivered as a truncated payload, so the corruption is now a visible error.
+Reassembly itself is still not implemented, so chunked topics remain unreadable — but no longer
+silently wrong.
 
 ### D4 — `with_receiver_queue_size(0)` silently becomes 1000 · **P3**
 
@@ -283,8 +301,8 @@ than individual fields.
 
 | Feature | Java | pulsar-rs | Rust RDG | Prio |
 |---|:--:|:--:|:--:|:--:|
-| `hasMessageAvailable()` | ✅ | ❌ | ❌ | **P1** — the canonical "read to end of topic then stop" loop cannot be written |
-| `startMessageIdInclusive` | ✅ | ❌ | ❌ | **P1** — off-by-one on resume from a stored position |
+| `hasMessageAvailable()` | ✅ | ❌ | ✅ | done — `Reader::has_message_available`, including a partly-read batch, whose messages all share one entry; the mark-delete refinement Java uses after a seek *by timestamp* is not modelled |
+| `startMessageIdInclusive` | ✅ | ❌ | ✅ | done — and the off-by-one ran the *other* way: `start_message_id` used to redeliver the start message, so a resume from a stored id processed it twice. Exclusive is now the default, as in Java |
 | Partitioned-topic reader | ✅ | ❌ | ❌ | P2 — explicitly rejected in `cf67345` |
 | Multi-topic reader | ✅ | ❌ | ❌ | P2 |
 | `startMessageFromRollbackDuration` | ✅ | ❌ | ❌ | P3 |
@@ -312,7 +330,7 @@ The Rust client has no schema *layer* — only a raw `proto::Schema` you fill in
 
 | Feature | Java | pulsar-rs | Rust RDG | Prio |
 |---|:--:|:--:|:--:|:--:|
-| TLS client-certificate auth (`AuthenticationTls`) | ✅ | ❌ | ❌ | **P1** — no `tlsCertificateFilePath` / `tlsKeyFilePath`; mTLS-authenticated clusters are unreachable |
+| TLS client-certificate auth (`AuthenticationTls`) | ✅ | ❌ | ✅ | done — `PulsarBuilder::with_client_identity` / `with_client_identity_files`; also declares the `tls` auth method on connect, which the certificate alone does not |
 | `listenerName` (advertised listener) | ✅ | ❌ | ✅ | done — `PulsarBuilder::with_listener_name`; rides on `CommandLookupTopic` only, as in Java |
 | `proxyServiceUrl` + `ProxyProtocol` (SNI routing) | ✅ | ❌ | ❌ | P2 — `proxy_through_service_url` is *read* in `service_discovery.rs:312` but not configurable |
 | Athenz | ✅ | ❌ | ❌ | P3 |
@@ -516,9 +534,9 @@ Everything a real deployment hits within the first week.
 | Item | Why it's here |
 |---|---|
 | ~~`autoUpdatePartitions`~~ | ✅ done — scaling a topic silently stranded traffic |
-| TLS client-certificate auth | Locks out mTLS clusters entirely |
+| ~~TLS client-certificate auth~~ | ✅ done — locked out mTLS clusters entirely |
 | ~~`listenerName`~~ | ✅ done — locked out every Kubernetes/multi-network cluster |
-| `Reader::has_message_available` + `startMessageIdInclusive` | The two most-requested reader primitives |
+| ~~`Reader::has_message_available` + `startMessageIdInclusive`~~ | ✅ done — the two most-requested reader primitives |
 | Ack grouping (`acknowledgmentGroupTime`, `maxAcknowledgmentGroupSize`) | Throughput |
 | Batch index acknowledgment | Prevents whole-batch redelivery |
 | `KeySharedPolicy` (AUTO_SPLIT / STICKY, `allowOutOfOrderDelivery`) | Key_Shared is unusable at scale without it |
@@ -685,7 +703,7 @@ entry_hash_max}`, `KeySharedMeta.entryBucketDispatch`,
 | CI matrix entry `5.0.0-M1` | upstream tops out at 4.1.2 |
 | CI: run `apply-config-from-env.py` | upstream's `PULSAR_PREFIX_*` env vars are **silently ignored** — verified inside the container. It works only because the defaults coincide with the port mapping and Linux runners can route to container IPs |
 | CI: config-applied guard step + `public/default` readiness wait | fails loudly if overrides stop applying; removes a real "Namespace not found" startup race |
-| Test count | 50 → 73 (+20 doctests) |
+| Test count | 50 → 254 (+21 doctests, +3 async-std) |
 
 ## Migrating partition routing from 6.x
 
@@ -730,16 +748,16 @@ added as an explicitly deprecated option.
 | Area | Java surface | Rust RDG coverage | Worst consequence today |
 |---|---|---|---|
 | Wire protocol | 81 command types | ~63 | No 5.0 topics, no topic watchers, no migration handling |
-| Producer | 38 builder options | ~12 | **Wrong partition vs Java for the same key** |
-| Consumer | 48 builder options | ~14 | **Chunked topics silently corrupt**; no retry-letter; Key_Shared unusable at scale |
-| Reader | 25 builder options | ~8 | Cannot detect end of topic |
+| Producer | 38 builder options | ~15 | Routing now matches Java; no `sendTimeout`, `initialSequenceId` or `maxPendingMessages` |
+| Consumer | 48 builder options | ~16 | Chunked messages now rejected rather than corrupting; still no retry-letter, and Key_Shared unusable at scale |
+| Reader | 25 builder options | ~10 | End of topic detectable via `has_message_available`; the seek-by-timestamp refinement is not modelled |
 | Schema | Full typed layer + AVRO/KeyValue/AUTO | Raw proto only | Wrong decode on evolved topics |
-| Auth | 8 providers | 4 | mTLS clusters unreachable |
-| Client | 60 builder options | ~10 | No listener name → unusable on k8s multi-network |
+| Auth | 8 providers | 5 | mTLS reachable via `with_client_identity`; no Athenz, Kerberos or OIDC-specific providers |
+| Client | 60 builder options | ~13 | `listenerName` supported, so multi-network clusters work; most tuning knobs still absent |
 | Admin | ~550 ops, 21 interfaces | 🟡 498 ops, all 21 interfaces | Five individual ops outstanding; test strength varies per operation |
 | Scalable topics (5.0) | 13 subsystems, 24 admin ops | admin ✅ 21 ops; client protocol ❌ | Admin can manage `topic://`, but nothing can produce to or consume from it |
 
-**Recommended immediate action:** build the parity harness, then run Phase 0. Phase 0 is roughly a
-week of work and removes three classes of silent data incorrectness — it is worth more than any
-amount of new feature surface added on top of a client that routes keys differently from everything
-else in the ecosystem.
+**Recommended immediate action:** Phase 0 is complete, and so are the four Phase 1 items struck
+through above. The next-highest-value work is the rest of Phase 1 — ack grouping, batch index
+acknowledgment, `KeySharedPolicy`, and the retry-letter/DLQ pattern — which is what a production
+consumer hits once the correctness gaps are closed.

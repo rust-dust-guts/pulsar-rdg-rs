@@ -263,14 +263,18 @@ pub struct AdminClient {
 pub struct AdminOptions {
     /// How long any single admin request may take, including its redirects.
     ///
-    /// Defaults to 30 seconds, matching what this client used to hard-code.
+    /// Defaults to 60 seconds, which is Java's `requestTimeoutMs`. It was 30 —
+    /// the value this client originally hard-coded — but a broker servicing
+    /// concurrent admin work can take longer than that on operations that touch
+    /// topic policies, and half of Java's allowance is not a useful place to give
+    /// up.
     pub timeout: Duration,
 }
 
 impl Default for AdminOptions {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(30),
+            timeout: Duration::from_secs(60),
         }
     }
 }

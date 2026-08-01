@@ -100,9 +100,21 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
                             | crate::message::proto::ServerError::MetadataError,
                     )
                 ) {
-                    if operation_retry_options.max_retries.is_none()
-                        || operation_retry_options.max_retries.unwrap() > current_retries
-                    {
+                    // `max_retries` defaults to `None`, meaning unlimited, so the
+                    // deadline is what stops a permanently-failing lookup. Without
+                    // it a condition the broker will never resolve — a listener
+                    // name it does not have, say, which it reports as
+                    // `ServiceNotReady` — retried silently for ever instead of
+                    // surfacing. Java does not retry a failed lookup at all;
+                    // `BinaryProtoLookupService.findBroker` fails the future and
+                    // lets the caller's operation timeout govern.
+                    let elapsed = start.elapsed();
+                    let within_deadline = elapsed < operation_retry_options.operation_timeout;
+                    let within_retry_budget = operation_retry_options
+                        .max_retries
+                        .is_none_or(|max| max > current_retries);
+
+                    if within_retry_budget && within_deadline {
                         error!("lookup({}) failed with {:?}, retrying request after {}ms (max_retries = {:?})", topic, error, operation_retry_options.retry_delay.as_millis(), operation_retry_options.max_retries);
                         current_retries += 1;
                         self.manager
@@ -110,6 +122,11 @@ impl<Exe: Executor> ServiceDiscovery<Exe> {
                             .delay(operation_retry_options.retry_delay)
                             .await;
                         continue;
+                    } else if !within_deadline {
+                        error!(
+                            "lookup({}) gave up after {:?}, past the {:?} operation timeout",
+                            topic, elapsed, operation_retry_options.operation_timeout
+                        );
                     } else {
                         error!("lookup({}) reached max retries", topic);
                     }
@@ -477,9 +494,16 @@ mod tests {
             plain.lookup_topic(topic).await.unwrap().broker_url
         );
 
-        // The broker reports a missing listener as `ServiceNotReady`, which this
-        // client retries indefinitely by default, so a misconfigured listener name
-        // hangs rather than failing. Bound the retries to see the error itself.
+        // The broker usually reports a missing listener as `ServiceNotReady`, and
+        // `max_retries: Some(0)` surfaces that immediately instead of retrying to
+        // the operation timeout.
+        //
+        // "Usually" is deliberate: the rejection is not guaranteed. Depending on
+        // the path the lookup takes, an unknown listener can still come back
+        // `Connect` — which is why the retry-deadline test next door drives a stub
+        // rather than this condition. This assertion holds because the topic here
+        // already exists, so the lookup resolves against an owned bundle; if it
+        // ever starts flaking, that is the reason, and a stub is the fix.
         let unconfigured: Pulsar<_> = Pulsar::builder(broker_url(), TokioExecutor)
             .with_listener_name("no-such-listener")
             .with_operation_retry_options(OperationRetryOptions {
@@ -497,6 +521,140 @@ mod tests {
         assert!(
             message.contains("no-such-listener"),
             "the broker should name the listener it is missing, got: {message}"
+        );
+    }
+
+    /// A broker that answers every lookup with `ServiceNotReady`.
+    ///
+    /// A stub rather than the real broker: the obvious way to provoke a
+    /// permanently failing lookup is a listener name the broker does not have,
+    /// but Pulsar does not reject those deterministically — depending on which
+    /// path the lookup takes, an unknown listener can still come back `Connect`.
+    /// A test built on that premise fails at random, which is exactly what this
+    /// one did. The condition under test is the retry loop, so the broker's
+    /// behaviour is worth controlling outright.
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn stub_broker_that_never_becomes_ready() -> u16 {
+        use futures::{SinkExt, StreamExt};
+        use tokio_util::codec::Framed;
+
+        use crate::message::{
+            proto::{
+                base_command::Type as CommandType, command_lookup_topic_response::LookupType,
+                BaseCommand, CommandConnected, CommandLookupTopicResponse, ServerError,
+            },
+            Codec, Message,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut framed = Framed::new(socket, Codec);
+                    while let Some(Ok(msg)) = framed.next().await {
+                        let reply = if msg.command.connect.is_some() {
+                            BaseCommand {
+                                r#type: CommandType::Connected as i32,
+                                connected: Some(CommandConnected::default()),
+                                ..Default::default()
+                            }
+                        } else if let Some(lookup) = msg.command.lookup_topic.as_ref() {
+                            BaseCommand {
+                                r#type: CommandType::LookupResponse as i32,
+                                lookup_topic_response: Some(CommandLookupTopicResponse {
+                                    request_id: lookup.request_id,
+                                    response: Some(LookupType::Failed as i32),
+                                    error: Some(ServerError::ServiceNotReady as i32),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }
+                        } else {
+                            continue;
+                        };
+                        if framed
+                            .send(Message {
+                                command: reply,
+                                payload: None,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        port
+    }
+
+    /// A lookup the broker will never satisfy has to give up, not retry for ever.
+    ///
+    /// `max_retries` defaults to `None` — unlimited — so before the deadline was
+    /// honoured this retried every 5 seconds for as long as the broker kept
+    /// answering `ServiceNotReady`, which is to say indefinitely.
+    #[tokio::test]
+    #[cfg(any(
+        feature = "tokio-runtime",
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring"
+    ))]
+    async fn a_lookup_that_can_never_succeed_gives_up_at_the_operation_timeout() {
+        use std::time::{Duration, Instant};
+
+        use crate::{
+            client::Pulsar, connection_manager::OperationRetryOptions,
+            error::ServiceDiscoveryError, executor::TokioExecutor,
+        };
+
+        let port = stub_broker_that_never_becomes_ready().await;
+        let timeout = Duration::from_secs(2);
+        let pulsar: Pulsar<_> =
+            Pulsar::builder(format!("pulsar://127.0.0.1:{port}"), TokioExecutor)
+                .with_operation_retry_options(OperationRetryOptions {
+                    operation_timeout: timeout,
+                    retry_delay: Duration::from_millis(100),
+                    // Unlimited, as by default: the deadline is what must stop this.
+                    max_retries: None,
+                })
+                .build()
+                .await
+                .unwrap();
+
+        let started = Instant::now();
+        let err = pulsar
+            .lookup_topic("persistent://public/default/never-resolves")
+            .await
+            .expect_err("the stub answers every lookup with ServiceNotReady");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= timeout,
+            "gave up after {elapsed:?}, before the {timeout:?} deadline"
+        );
+        assert!(
+            elapsed < timeout * 5,
+            "took {elapsed:?}, far past the {timeout:?} deadline"
+        );
+        // The specific error matters: giving up must surface what the broker kept
+        // reporting, not some unrelated failure that would also end the loop.
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::ServiceDiscovery(ServiceDiscoveryError::Query(
+                    Some(crate::message::proto::ServerError::ServiceNotReady),
+                    _
+                ))
+            ),
+            "expected the broker's ServiceNotReady to surface, got: {err:?}"
         );
     }
 }

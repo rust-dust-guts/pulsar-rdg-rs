@@ -2,3 +2,19 @@
 .idea
 **/*.rs.bk
 Cargo.lock
+
+# Throwaway TLS material for the mTLS tests. scripts/start_test_broker.sh writes
+# these into a mktemp directory, but a cert step run by hand from the repo root
+# leaves them here — and these are private keys, which must never be committed
+# even for a test CA.
+/ca.crt
+/ca.key
+/ca.srl
+/client.crt
+/client.csr
+/client.key
+/client.key.pkcs1
+/server.crt
+/server.csr
+/server.key
+/server.key.pkcs1

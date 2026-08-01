@@ -190,7 +190,7 @@ pub use admin::{AdminClient, AdminOptions};
 pub use client::{DeserializeMessage, Pulsar, PulsarBuilder, SerializeMessage};
 pub use connection::{Authentication, BrokerFeatures};
 pub use connection_manager::{
-    BrokerAddress, ConnectionRetryOptions, OperationRetryOptions, TlsOptions,
+    BrokerAddress, ClientIdentity, ConnectionRetryOptions, OperationRetryOptions, TlsOptions,
 };
 pub use consumer::{Consumer, ConsumerBuilder, ConsumerOptions};
 pub use error::Error;
@@ -212,6 +212,7 @@ pub use message::{
     Payload,
 };
 pub use producer::{MultiTopicProducer, Producer, ProducerOptions};
+pub use reader::Reader;
 pub use routing_policy::{CustomRoutingPolicy, HashingScheme, RoutingPolicy};
 
 #[cfg(feature = "admin-api")]
@@ -393,6 +394,7 @@ mod tests {
         }
         assert_eq!(received.len(), message_ids.len());
         assert_eq!(received, message_ids);
+        test_utils::delete_topic("public", "default", &topic).await;
     }
 
     #[tokio::test]
@@ -441,6 +443,7 @@ mod tests {
             if data.as_str() != send_data {
                 panic!("Unexpected payload in &str test: {}", &data);
             }
+            test_utils::delete_topic("public", "default", &topic).await;
         }
 
         // test &[u8]
@@ -478,6 +481,7 @@ mod tests {
             if data.as_slice() != send_data {
                 panic!("Unexpected payload in &[u8] test: {:?}", &data);
             }
+            test_utils::delete_topic("public", "default", &topic).await;
         }
     }
 
@@ -499,7 +503,7 @@ mod tests {
 
         let mut consumer: Consumer<String, _> = pulsar
             .consumer()
-            .with_topic(topic)
+            .with_topic(&topic)
             .with_unacked_message_resend_delay(Some(Duration::from_millis(100)))
             .with_options(ConsumerOptions {
                 initial_position: InitialPosition::Earliest,
@@ -524,6 +528,7 @@ mod tests {
         consumer.ack(&second_receipt).await.unwrap();
 
         assert!(redelivery < Duration::from_secs(1));
+        test_utils::delete_topic("public", "default", &topic).await;
     }
 
     const EMPTY_VALUES: Vec<String> = vec![];
@@ -655,6 +660,7 @@ mod tests {
         let _ = producer.close().await;
         let error = producer.send_non_blocking("msg").await.err().unwrap();
         assert_matches!(error, PulsarError::Producer(ProducerError::Closed));
+        test_utils::delete_topic("public", "default", &topic).await;
     }
 
     #[tokio::test]
@@ -709,6 +715,7 @@ mod tests {
 
         let error = producer.send_batch().await.err().unwrap();
         assert_matches!(error, PulsarError::Producer(ProducerError::Closed));
+        test_utils::delete_topic("public", "default", &topic).await;
     }
 
     async fn create_batched_producer<Exe>(
@@ -878,6 +885,7 @@ mod tests {
         assert!(resp.status().is_success());
         let value: u32 = resp.json().await.unwrap();
         assert_eq!(value, 200);
+        test_utils::delete_topic("public", "default", &topic_name).await;
     }
 
     /// PIP-344: with auto-creation disabled, a lookup for a topic that does not
@@ -1002,6 +1010,8 @@ mod tests {
                 .unwrap(),
             0
         );
+        test_utils::delete_partitioned_topic("public", "default", &partitioned).await;
+        test_utils::delete_topic("public", "default", &plain).await;
     }
 
     /// The default lookup keeps its historical create-on-lookup behavior, so
@@ -1051,5 +1061,6 @@ mod tests {
                 assert_eq!(last_msg_id.entry_id, msg_id.entry_id);
             }
         }
+        test_utils::delete_partitioned_topic("public", "default", &topic).await;
     }
 }

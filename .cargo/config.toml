@@ -1,0 +1,12 @@
+# Cap test parallelism.
+#
+# The integration tests all share one broker, and Rust's default — one test
+# thread per core — overruns it: on a 12-core machine roughly one run in twenty
+# failed, each time on a different test, none of them reproducible on their own.
+# Four threads held for every run measured, and cost about 9 seconds.
+#
+# `[env]` does not override a value already in the environment, so CI (which sets
+# RUST_TEST_THREADS=1 explicitly) still runs serially, and anyone who wants a
+# different number can just export it.
+[env]
+RUST_TEST_THREADS = "4"

@@ -26,6 +26,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
+    connection_manager::ClientIdentity,
     consumer::ConsumerOptions,
     error::{AuthenticationError, ConnectionError, SharedError},
     executor::{Executor, ExecutorKind},
@@ -36,6 +37,72 @@ use crate::{
     producer::{self, ProducerOptions},
     Certificate,
 };
+
+/// Builds the backend's client-certificate type from PEM.
+///
+/// Two of them, because the four supported TLS stacks split two ways on what
+/// they accept: native-tls takes the PEM as-is, rustls wants it parsed.
+#[cfg(any(feature = "tokio-runtime", feature = "async-std-runtime"))]
+fn native_tls_identity(identity: &ClientIdentity) -> Result<native_tls::Identity, ConnectionError> {
+    native_tls::Identity::from_pkcs8(&identity.certificate_chain, &identity.private_key)
+        .map_err(|e| ConnectionError::Io(std::io::Error::other(e)))
+}
+
+/// Parses a PEM chain and key into the rustls types.
+///
+/// The key's PEM tag decides the variant: mislabelling a PKCS#1 or SEC1 key as
+/// PKCS#8 makes rustls reject a perfectly good key, and `openssl genrsa` still
+/// emits PKCS#1 by default, so all three are handled.
+#[cfg(all(
+    any(
+        feature = "tokio-rustls-runtime-aws-lc-rs",
+        feature = "tokio-rustls-runtime-ring",
+        feature = "async-std-rustls-runtime-aws-lc-rs",
+        feature = "async-std-rustls-runtime-ring"
+    ),
+    not(any(feature = "tokio-runtime", feature = "async-std-runtime"))
+))]
+#[allow(clippy::type_complexity)]
+fn rustls_identity(
+    identity: &ClientIdentity,
+) -> Result<
+    (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    ConnectionError,
+> {
+    use rustls::pki_types::{
+        CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+    };
+
+    let chain: Vec<CertificateDer<'static>> = pem::parse_many(&identity.certificate_chain)
+        .map_err(|e| ConnectionError::Io(std::io::Error::other(e)))?
+        .into_iter()
+        .map(|cert| CertificateDer::from(cert.into_contents()))
+        .collect();
+    if chain.is_empty() {
+        return Err(ConnectionError::Io(std::io::Error::other(
+            "the client certificate chain contains no certificates",
+        )));
+    }
+
+    let key = pem::parse(&identity.private_key)
+        .map_err(|e| ConnectionError::Io(std::io::Error::other(e)))?;
+    let der = key.contents().to_vec();
+    let key = match key.tag() {
+        "PRIVATE KEY" => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)),
+        "RSA PRIVATE KEY" => PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(der)),
+        "EC PRIVATE KEY" => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(der)),
+        other => {
+            return Err(ConnectionError::Io(std::io::Error::other(format!(
+                "unsupported private key PEM tag {other:?}, expected one of PRIVATE KEY, \
+                 RSA PRIVATE KEY or EC PRIVATE KEY"
+            ))))
+        }
+    };
+    Ok((chain, key))
+}
 
 pub(crate) enum Register {
     Request {
@@ -930,6 +997,7 @@ impl<Exe: Executor> Connection<Exe> {
         certificate_chain: &[Certificate],
         allow_insecure_connection: bool,
         tls_hostname_verification_enabled: bool,
+        client_identity: Option<&ClientIdentity>,
         connection_timeout: Duration,
         operation_timeout: Duration,
         outbound_channel_size: usize,
@@ -940,6 +1008,29 @@ impl<Exe: Executor> Connection<Exe> {
             return Err(ConnectionError::NotFound);
         }
         let hostname = url.host().map(|s| s.to_string());
+
+        // Presenting a client certificate is not enough on its own: the broker
+        // dispatches on `CommandConnect.auth_method_name`, so a client that offers
+        // a certificate but names no method is refused with "Failed to
+        // authenticate" even though the TLS handshake succeeded. Java bundles the
+        // two together in `AuthenticationTls`, which supplies the certificate and
+        // reports "tls" as its method.
+        //
+        // An explicitly configured provider still wins — a token over an mTLS
+        // transport is a legitimate setup, and there the certificate is only
+        // transport security.
+        let auth_data = match (auth_data, client_identity) {
+            (None, Some(_)) => {
+                let tls_auth = Authentication {
+                    name: "tls".to_string(),
+                    data: Vec::new(),
+                };
+                Some(Arc::new(Mutex::new(
+                    Box::new(tls_auth) as Box<dyn crate::authentication::Authentication>
+                )))
+            }
+            (auth_data, _) => auth_data,
+        };
 
         let tls = match url.scheme() {
             "pulsar" => false,
@@ -989,6 +1080,7 @@ impl<Exe: Executor> Connection<Exe> {
                 certificate_chain,
                 allow_insecure_connection,
                 tls_hostname_verification_enabled,
+                client_identity,
                 executor.clone(),
                 operation_timeout,
                 outbound_channel_size,
@@ -1066,6 +1158,7 @@ impl<Exe: Executor> Connection<Exe> {
         certificate_chain: &[Certificate],
         allow_insecure_connection: bool,
         tls_hostname_verification_enabled: bool,
+        client_identity: Option<&ClientIdentity>,
         executor: Arc<Exe>,
         operation_timeout: Duration,
         outbound_channel_size: usize,
@@ -1084,6 +1177,9 @@ impl<Exe: Executor> Connection<Exe> {
                         allow_insecure_connection || !tls_hostname_verification_enabled,
                     );
                     builder.danger_accept_invalid_certs(allow_insecure_connection);
+                    if let Some(identity) = client_identity {
+                        builder.identity(native_tls_identity(identity)?);
+                    }
                     let cx = builder.build()?;
                     let cx = tokio_native_tls::TlsConnector::from(cx);
                     let stream = cx
@@ -1135,9 +1231,16 @@ impl<Exe: Executor> Connection<Exe> {
                         root_store.add(certificate.clone())?;
                     }
 
-                    let config = rustls::ClientConfig::builder()
-                        .with_root_certificates(root_store)
-                        .with_no_client_auth();
+                    let config = rustls::ClientConfig::builder().with_root_certificates(root_store);
+                    let config = match client_identity {
+                        Some(identity) => {
+                            let (chain, key) = rustls_identity(identity)?;
+                            config
+                                .with_client_auth_cert(chain, key)
+                                .map_err(|e| ConnectionError::Io(std::io::Error::other(e)))?
+                        }
+                        None => config.with_no_client_auth(),
+                    };
 
                     let cx = tokio_rustls::TlsConnector::from(Arc::new(config));
                     let stream = cx
@@ -1195,6 +1298,9 @@ impl<Exe: Executor> Connection<Exe> {
                         allow_insecure_connection || !tls_hostname_verification_enabled,
                     );
                     connector = connector.danger_accept_invalid_certs(allow_insecure_connection);
+                    if let Some(identity) = client_identity {
+                        connector = connector.identity(native_tls_identity(identity)?);
+                    }
                     let stream = connector
                         .connect(&hostname, stream)
                         .await
@@ -1245,9 +1351,16 @@ impl<Exe: Executor> Connection<Exe> {
                         root_store.add(certificate.clone())?;
                     }
 
-                    let config = rustls::ClientConfig::builder()
-                        .with_root_certificates(root_store)
-                        .with_no_client_auth();
+                    let config = rustls::ClientConfig::builder().with_root_certificates(root_store);
+                    let config = match client_identity {
+                        Some(identity) => {
+                            let (chain, key) = rustls_identity(identity)?;
+                            config
+                                .with_client_auth_cert(chain, key)
+                                .map_err(|e| ConnectionError::Io(std::io::Error::other(e)))?
+                        }
+                        None => config.with_no_client_auth(),
+                    };
 
                     let connector = futures_rustls::TlsConnector::from(Arc::new(config));
                     let stream = connector
@@ -2336,5 +2449,123 @@ mod tests {
             }
             _ => panic!("Unexpected message"),
         };
+    }
+}
+
+/// mTLS: the client presents a certificate and the broker derives its role from it.
+///
+/// Skips unless `scripts/start_test_broker.sh` put an mTLS broker in the topology.
+#[cfg(test)]
+mod client_certificate_tests {
+    use crate::{
+        consumer::{ConsumerOptions, InitialPosition},
+        executor::TokioExecutor,
+        message::proto::command_subscribe::SubType,
+        test_utils, Consumer, Pulsar,
+    };
+    use futures::TryStreamExt;
+
+    /// The mTLS broker's address and the PEMs it trusts.
+    struct TlsFixture {
+        url: String,
+        ca: Vec<u8>,
+        client_cert: Vec<u8>,
+        client_key: Vec<u8>,
+    }
+
+    /// Reads the fixture, or `None` when this topology has no mTLS broker.
+    fn tls_fixture() -> Option<TlsFixture> {
+        let url = test_utils::tls_broker_url()?;
+        let dir = test_utils::tls_cert_dir()?;
+        Some(TlsFixture {
+            url,
+            ca: std::fs::read(dir.join("ca.crt")).expect("ca.crt"),
+            client_cert: std::fs::read(dir.join("client.crt")).expect("client.crt"),
+            client_key: std::fs::read(dir.join("client.key")).expect("client.key"),
+        })
+    }
+
+    /// With a client certificate: connect, publish and consume.
+    ///
+    /// The broker runs `AuthenticationProviderTls`, so reaching the point of
+    /// publishing at all means it accepted the certificate and mapped its
+    /// subject to a role. `a_connection_without_a_client_certificate_is_refused`
+    /// is the other half — without the certificate the same setup fails.
+    #[tokio::test]
+    async fn a_client_certificate_authenticates_the_connection() {
+        let Some(fixture) = tls_fixture() else {
+            log::warn!("no mTLS broker in the topology, skipping");
+            return;
+        };
+        let _ = log::set_logger(&crate::tests::TEST_LOGGER);
+        log::set_max_level(log::LevelFilter::Debug);
+
+        let pulsar: Pulsar<_> = Pulsar::builder(&fixture.url, TokioExecutor)
+            .with_certificate_chain(fixture.ca)
+            .with_client_identity(fixture.client_cert, fixture.client_key)
+            .build()
+            .await
+            .expect("the broker should accept our client certificate");
+
+        let topic = format!("persistent://public/default/mtls-{}", rand::random::<u32>());
+        let mut producer = pulsar.producer().with_topic(&topic).build().await.unwrap();
+        producer
+            .send_non_blocking("over mtls")
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let mut consumer: Consumer<String, _> = pulsar
+            .consumer()
+            .with_topic(&topic)
+            .with_subscription("mtls-sub")
+            .with_subscription_type(SubType::Exclusive)
+            .with_options(
+                ConsumerOptions::default().with_initial_position(InitialPosition::Earliest),
+            )
+            .build()
+            .await
+            .unwrap();
+        let msg = consumer
+            .try_next()
+            .await
+            .unwrap()
+            .expect("a message published over mTLS");
+        assert_eq!(msg.deserialize().unwrap(), "over mtls");
+
+        producer.close().await.unwrap();
+    }
+
+    /// Without one, the same broker refuses the connection.
+    ///
+    /// This is the negative control for the test above, and it is what makes that
+    /// test meaningful: it fails if `with_client_identity` is a no-op, because
+    /// then both tests would take the same path and both would pass — or both
+    /// would fail.
+    #[tokio::test]
+    async fn a_connection_without_a_client_certificate_is_refused() {
+        let Some(fixture) = tls_fixture() else {
+            log::warn!("no mTLS broker in the topology, skipping");
+            return;
+        };
+
+        // The CA is still supplied, so this is not a *server* trust failure: the
+        // only thing missing is the client's own certificate.
+        let result = Pulsar::builder(&fixture.url, TokioExecutor)
+            .with_certificate_chain(fixture.ca)
+            .build()
+            .await;
+
+        match result {
+            Err(e) => {
+                log::info!("anonymous connection refused as expected: {e}");
+            }
+            Ok(_) => panic!(
+                "the broker runs tlsRequireTrustedClientCertOnConnect with \
+                 AuthenticationProviderTls, so a client offering no certificate must \
+                 not get a usable connection"
+            ),
+        }
     }
 }

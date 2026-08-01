@@ -143,6 +143,27 @@ pub struct TlsOptions {
     ///
     /// defaults to *true*
     pub tls_hostname_verification_enabled: bool,
+
+    /// client certificate presented to the broker, for mTLS-authenticated clusters
+    ///
+    /// Corresponds to Java's `tlsCertificateFilePath` / `tlsKeyFilePath` pair, and
+    /// to what `AuthenticationTls` supplies. `None` means no client certificate is
+    /// offered, which is what a broker configured with
+    /// `tlsRequireTrustedClientCertOnConnect` refuses.
+    pub client_identity: Option<ClientIdentity>,
+}
+
+/// A client certificate chain and its private key, both PEM-encoded.
+///
+/// Kept as PEM rather than a parsed type because the four TLS backends this
+/// crate can be built against want different parsed forms, and the bytes are the
+/// one representation all of them accept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientIdentity {
+    /// PEM-encoded certificate chain, leaf first.
+    pub certificate_chain: Vec<u8>,
+    /// PEM-encoded private key: PKCS#8, PKCS#1 or SEC1.
+    pub private_key: Vec<u8>,
 }
 
 impl Default for TlsOptions {
@@ -152,6 +173,7 @@ impl Default for TlsOptions {
             certificate_chain: None,
             allow_insecure_connection: false,
             tls_hostname_verification_enabled: true,
+            client_identity: None,
         }
     }
 }
@@ -391,6 +413,7 @@ impl<Exe: Executor> ConnectionManager<Exe> {
                 &self.certificate_chain,
                 self.tls_options.allow_insecure_connection,
                 self.tls_options.tls_hostname_verification_enabled,
+                self.tls_options.client_identity.as_ref(),
                 self.connection_retry_options.connection_timeout,
                 self.operation_retry_options.operation_timeout,
                 self.outbound_channel_size,

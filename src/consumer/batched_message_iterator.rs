@@ -43,8 +43,12 @@ impl Iterator for BatchedMessageIterator {
         let index = self.current_index;
         self.current_index += 1;
         if let Some(batched_message) = self.messages.next() {
+            // `batch_size` travels with the id so a consumer can tell a partly-read
+            // batch from a fully-read one: every message in a batch shares one
+            // entry, so comparing positions alone cannot see the remainder.
             let id = MessageIdData {
                 batch_index: Some(index as i32),
+                batch_size: Some(self.total_messages as i32),
                 ..self.message_id.clone()
             };
 

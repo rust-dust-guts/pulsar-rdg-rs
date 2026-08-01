@@ -170,6 +170,30 @@ impl<T: DeserializeMessage, Exe: Executor> Reader<T, Exe> {
         self.consumer.last_message_received()
     }
 
+    /// Whether the topic holds a message this reader has not returned yet.
+    ///
+    /// The canonical use is draining a topic and stopping at the end, which the
+    /// stream alone cannot express — it blocks identically whether the topic is
+    /// merely quiet or fully read:
+    ///
+    /// ```rust,no_run
+    /// # async fn run(mut reader: pulsar::Reader<String, pulsar::TokioExecutor>) -> Result<(), pulsar::Error> {
+    /// use futures::StreamExt;
+    /// while reader.has_message_available().await? {
+    ///     if let Some(msg) = reader.next().await {
+    ///         println!("{:?}", msg?.deserialize());
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Costs one round trip to the broker per call.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn has_message_available(&mut self) -> Result<bool, Error> {
+        self.consumer.has_message_available().await
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub async fn get_last_message_id(&mut self) -> Result<MessageIdData, Error> {
         self.consumer.get_last_message_id().await
@@ -257,8 +281,11 @@ mod tests {
         assert_eq!(reader.sub_type(), SubType::Exclusive);
         assert_eq!(reader.batch_size(), None);
         assert_eq!(reader.reader_name().unwrap(), "test_reader");
-        let reader_id = reader.reader_id();
-        assert!(reader_id > 0);
+        // No assertion on `reader_id()`'s value: it comes from a process-wide
+        // counter that starts at zero, so the previous `> 0` check only held when
+        // another test had created a consumer first and failed when this test ran
+        // alone. Zero is a valid consumer id, and there is nothing else about it
+        // worth asserting here.
 
         let message = TestData {
             data: "test_reader_data".to_string(),
@@ -303,6 +330,7 @@ mod tests {
         reader.seek(seek_message_id, None).await.unwrap();
         let seek_message = reader_messages(&mut reader, message_count / 2, 5000).await;
         assert!(seek_message.len() <= message_count / 2);
+        crate::test_utils::delete_topic("public", "default", &topic).await;
     }
 
     async fn reader_messages(
@@ -328,5 +356,264 @@ mod tests {
             }
         }
         messages
+    }
+
+    /// `start_message_id` names a resume cursor, so by default reading begins
+    /// *after* it — the message itself is not redelivered.
+    ///
+    /// Before this, the start message came back too, so a caller storing "the
+    /// last id I processed" and restarting from it processed that message twice.
+    /// `start_message_id_inclusive` is the opt-in to the old behaviour, and is
+    /// Java's `startMessageIdInclusive()`.
+    async fn assert_start_message_boundary(inclusive: bool, want: &[&str]) {
+        assert_start_message_boundary_on(
+            inclusive,
+            want,
+            &format!(
+                "persistent://public/default/startid-{}",
+                rand::random::<u32>()
+            ),
+        )
+        .await;
+    }
+
+    async fn assert_start_message_boundary_on(inclusive: bool, want: &[&str], topic: &str) {
+        let client: Pulsar<_> = Pulsar::builder(crate::test_utils::broker_url(), TokioExecutor)
+            .build()
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..5u32 {
+            let receipt = client
+                .send(topic, format!("m{i}"))
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+            ids.push(receipt.message_id.unwrap());
+        }
+
+        let mut reader: Reader<String, _> = client
+            .consumer()
+            .with_topic(topic)
+            .with_consumer_name("start-id")
+            .with_options(ConsumerOptions {
+                start_message_id: Some(ids[2].clone()),
+                start_message_id_inclusive: inclusive,
+                ..Default::default()
+            })
+            .into_reader()
+            .await
+            .unwrap();
+
+        let mut got: Vec<String> = Vec::new();
+        while got.len() < want.len() + 1 {
+            match tokio::time::timeout(Duration::from_secs(2), reader.next()).await {
+                Ok(Some(Ok(m))) => got.push(m.deserialize().unwrap()),
+                _ => break,
+            }
+        }
+        assert_eq!(got, want, "inclusive = {inclusive}");
+
+        crate::test_utils::delete_topic("public", "default", topic.rsplit('/').next().unwrap())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn reading_from_a_start_id_skips_that_message_by_default() {
+        assert_start_message_boundary(false, &["m3", "m4"]).await;
+    }
+
+    #[tokio::test]
+    async fn reading_from_a_start_id_can_include_it() {
+        assert_start_message_boundary(true, &["m2", "m3", "m4"]).await;
+    }
+
+    /// The drain-to-end loop: `has_message_available` must go false exactly when
+    /// the backlog runs out, and true again when something new is published.
+    ///
+    /// The empty topic is covered separately by
+    /// `has_message_available_is_false_on_an_empty_topic`.
+    #[tokio::test]
+    async fn has_message_available_tracks_the_end_of_the_topic() {
+        let client: Pulsar<_> = Pulsar::builder(crate::test_utils::broker_url(), TokioExecutor)
+            .build()
+            .await
+            .unwrap();
+        let topic = format!(
+            "persistent://public/default/hasmsg-{}",
+            rand::random::<u32>()
+        );
+        // One message, so the drain below has exactly one to find.
+        client
+            .send(&topic, "seed".to_string())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+
+        let mut reader: Reader<String, _> = client
+            .consumer()
+            .with_topic(&topic)
+            .with_consumer_name("hasmsg")
+            .with_options(ConsumerOptions {
+                initial_position: crate::consumer::InitialPosition::Earliest,
+                ..Default::default()
+            })
+            .into_reader()
+            .await
+            .unwrap();
+
+        assert!(
+            reader.has_message_available().await.unwrap(),
+            "one message was published and none read"
+        );
+
+        let mut drained = 0;
+        while reader.has_message_available().await.unwrap() {
+            match tokio::time::timeout(Duration::from_secs(5), reader.next()).await {
+                Ok(Some(Ok(_))) => drained += 1,
+                other => panic!("expected a message while one was reported available: {other:?}"),
+            }
+        }
+        assert_eq!(drained, 1, "should have drained exactly what was published");
+
+        // Publishing again must flip it back.
+        client
+            .send(&topic, "more".to_string())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(
+            reader.has_message_available().await.unwrap(),
+            "a newly published message must be reported available"
+        );
+
+        crate::test_utils::delete_topic("public", "default", topic.rsplit('/').next().unwrap())
+            .await;
+    }
+
+    /// A reader that has read nothing on a topic with nothing to read.
+    // `cfg`, not `cfg_attr(..., ignore)`: the body uses the admin client, so
+    // without the feature this must not be *compiled*, not merely skipped at run
+    // time. `ignore` alone left `cargo test` failing to build.
+    #[cfg(feature = "admin-api")]
+    #[tokio::test]
+    async fn has_message_available_is_false_on_an_empty_topic() {
+        use crate::admin::AdminClient;
+
+        let client: Pulsar<_> = Pulsar::builder(crate::test_utils::broker_url(), TokioExecutor)
+            .build()
+            .await
+            .unwrap();
+        let topic = format!(
+            "persistent://public/default/hasmsg-empty-{}",
+            rand::random::<u32>()
+        );
+        let admin: AdminClient = client.admin(crate::test_utils::admin_url()).unwrap();
+        admin
+            .topics()
+            .create_non_partitioned_topic(&topic)
+            .await
+            .unwrap();
+
+        let mut reader: Reader<String, _> = client
+            .consumer()
+            .with_topic(&topic)
+            .with_consumer_name("hasmsg-empty")
+            .with_options(ConsumerOptions {
+                initial_position: crate::consumer::InitialPosition::Earliest,
+                ..Default::default()
+            })
+            .into_reader()
+            .await
+            .unwrap();
+
+        assert!(
+            !reader.has_message_available().await.unwrap(),
+            "an empty topic has nothing available"
+        );
+
+        crate::test_utils::delete_topic("public", "default", topic.rsplit('/').next().unwrap())
+            .await;
+    }
+
+    /// Regression: the filter used to be gated on the topic string starting with
+    /// `persistent://`, so an unqualified name — which Pulsar accepts and expands
+    /// to the persistent domain itself — skipped the filter entirely and silently
+    /// redelivered the start message.
+    #[tokio::test]
+    async fn a_start_id_is_exclusive_for_an_unqualified_topic_name_too() {
+        let topic = format!("startid-short-{}", rand::random::<u32>());
+        assert_start_message_boundary_on(false, &["m3", "m4"], &topic).await;
+    }
+
+    /// Regression: a partly-read batch still has messages available.
+    ///
+    /// Every message in a batch shares one entry, so once the first is delivered
+    /// the broker's last id already equals the reader's position and a
+    /// position-only comparison reports the topic drained — losing the rest of the
+    /// batch from a `while has_message_available()` loop.
+    #[tokio::test]
+    async fn has_message_available_sees_the_rest_of_a_partly_read_batch() {
+        use crate::producer::ProducerOptions;
+
+        let client: Pulsar<_> = Pulsar::builder(crate::test_utils::broker_url(), TokioExecutor)
+            .build()
+            .await
+            .unwrap();
+        let topic = format!(
+            "persistent://public/default/batched-hasmsg-{}",
+            rand::random::<u32>()
+        );
+
+        const BATCH: usize = 10;
+        let mut producer = client
+            .producer()
+            .with_topic(&topic)
+            .with_options(ProducerOptions {
+                batch_size: Some(BATCH as u32),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        for i in 0..BATCH {
+            producer.send_non_blocking(format!("m{i}")).await.unwrap();
+        }
+        producer.send_batch().await.unwrap();
+
+        let mut reader: Reader<String, _> = client
+            .consumer()
+            .with_topic(&topic)
+            .with_consumer_name("batched-hasmsg")
+            .with_options(ConsumerOptions {
+                initial_position: crate::consumer::InitialPosition::Earliest,
+                ..Default::default()
+            })
+            .into_reader()
+            .await
+            .unwrap();
+
+        // Drain by asking first, exactly as the documented loop does.
+        let mut drained = 0;
+        while reader.has_message_available().await.unwrap() {
+            match tokio::time::timeout(Duration::from_secs(5), reader.next()).await {
+                Ok(Some(Ok(_))) => drained += 1,
+                other => panic!("a message was reported available but none arrived: {other:?}"),
+            }
+            if drained > BATCH {
+                break;
+            }
+        }
+        assert_eq!(
+            drained, BATCH,
+            "the whole batch should be drained, not just its first message"
+        );
+
+        producer.close().await.unwrap();
+        crate::test_utils::delete_topic("public", "default", topic.rsplit('/').next().unwrap())
+            .await;
     }
 }

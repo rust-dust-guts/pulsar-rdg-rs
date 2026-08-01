@@ -691,6 +691,8 @@ mod tests {
             .build::<TestData>()
             .await;
         assert!(consumer_1_exclusive.is_ok());
+        crate::test_utils::delete_topic("public", "default", &topic1).await;
+        crate::test_utils::delete_topic("public", "default", &topic2).await;
     }
 
     #[tokio::test]
@@ -725,6 +727,7 @@ mod tests {
             .unwrap();
         let size = consumer.options().receiver_queue_size.unwrap();
         assert_eq!(size, 1000);
+        crate::test_utils::delete_topic("public", "default", &topic).await;
     }
 
     #[tokio::test]
@@ -839,6 +842,7 @@ mod tests {
             consumer.unsubscribe().await.unwrap();
             consumer.close().await.unwrap();
         }
+        crate::test_utils::delete_topic("public", "default", &topic).await;
     }
 
     #[tokio::test]
@@ -980,6 +984,8 @@ mod tests {
             "message event time should be preserved when the message is sent to the DLQ"
         );
         dlq_consumer.ack(&dlq_msg).await.unwrap();
+        crate::test_utils::delete_topic("public", "default", &topic).await;
+        crate::test_utils::delete_topic("public", "default", &format!("{topic}_dlq")).await;
     }
 
     #[tokio::test]
@@ -1156,6 +1162,8 @@ mod tests {
             );
             dlq_consumer.ack(&dlq_msg).await.unwrap();
         }
+        crate::test_utils::delete_topic("public", "default", &topic).await;
+        crate::test_utils::delete_topic("public", "default", &format!("{topic}_dlq")).await;
     }
 
     #[tokio::test]
@@ -1220,6 +1228,7 @@ mod tests {
                  consumer_2: {consumed_2}"
             ),
         }
+        crate::test_utils::delete_topic("public", "default", &topic).await;
     }
 
     #[tokio::test]
@@ -1334,6 +1343,7 @@ mod tests {
         // then check if all messages were received
         assert_eq!(50, consumed_1);
         assert_eq!(100, consumed_2);
+        crate::test_utils::delete_topic("public", "default", &topic).await;
     }
 
     #[tokio::test]
@@ -1408,6 +1418,8 @@ mod tests {
             .await
             .unwrap();
 
+        // Cloned before the spawn takes ownership, so cleanup can still name it.
+        let topic_for_cleanup = topic.clone();
         let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
 
         let join_handle = tokio::spawn(async move {
@@ -1457,6 +1469,7 @@ mod tests {
             .unwrap();
 
         join_handle.await.unwrap();
+        crate::test_utils::delete_topic("public", "default", &topic_for_cleanup).await;
     }
 
     // ── schema_version test helpers ───────────────────────────────────
@@ -1617,6 +1630,7 @@ mod tests {
         );
 
         consumer.ack(&msg).await.unwrap();
+        crate::test_utils::delete_topic("public", "default", &topic).await;
     }
 
     #[tokio::test]
@@ -1690,6 +1704,7 @@ mod tests {
             schema_versions[0], schema_versions[1],
             "both messages in the same batch should carry the same schema_version"
         );
+        crate::test_utils::delete_topic("public", "default", &topic).await;
     }
 
     #[tokio::test]
@@ -1773,6 +1788,7 @@ mod tests {
         );
 
         consumer.ack(&msg).await.unwrap();
+        crate::test_utils::delete_topic("public", "default", &topic).await;
     }
 
     #[tokio::test]
@@ -1834,6 +1850,7 @@ mod tests {
         );
 
         consumer.ack(&msg).await.unwrap();
+        crate::test_utils::delete_topic("public", "default", &topic).await;
     }
 
     /// A consumer must start consuming partitions added after it subscribed,
@@ -1843,10 +1860,13 @@ mod tests {
     /// different paths: more than one partition builds a `MultiTopicConsumer`,
     /// which already re-checks on its refresh interval, while exactly one builds
     /// a `Single` consumer.
-    #[cfg(any(
-        feature = "tokio-runtime",
-        feature = "tokio-rustls-runtime-aws-lc-rs",
-        feature = "tokio-rustls-runtime-ring"
+    #[cfg(all(
+        feature = "admin-api",
+        any(
+            feature = "tokio-runtime",
+            feature = "tokio-rustls-runtime-aws-lc-rs",
+            feature = "tokio-rustls-runtime-ring"
+        )
     ))]
     async fn assert_consumer_follows_partition_growth(initial: i32) {
         use crate::{producer::ProducerOptions, routing_policy::RoutingPolicy};
@@ -1952,7 +1972,10 @@ mod tests {
         feature = "tokio-rustls-runtime-aws-lc-rs",
         feature = "tokio-rustls-runtime-ring"
     ))]
-    #[cfg_attr(not(feature = "admin-api"), ignore)]
+    // `cfg`, not `cfg_attr(..., ignore)`: the body uses the admin client, so
+    // without the feature this must not be *compiled*, not merely skipped at run
+    // time. `ignore` alone left `cargo test` failing to build.
+    #[cfg(feature = "admin-api")]
     async fn a_consumer_follows_partition_growth_from_two() {
         assert_consumer_follows_partition_growth(2).await;
     }
@@ -1964,7 +1987,10 @@ mod tests {
         feature = "tokio-rustls-runtime-aws-lc-rs",
         feature = "tokio-rustls-runtime-ring"
     ))]
-    #[cfg_attr(not(feature = "admin-api"), ignore)]
+    // `cfg`, not `cfg_attr(..., ignore)`: the body uses the admin client, so
+    // without the feature this must not be *compiled*, not merely skipped at run
+    // time. `ignore` alone left `cargo test` failing to build.
+    #[cfg(feature = "admin-api")]
     async fn a_consumer_follows_partition_growth_from_one() {
         assert_consumer_follows_partition_growth(1).await;
     }

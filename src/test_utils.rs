@@ -38,6 +38,29 @@ pub(crate) fn proxy_broker_url() -> Option<String> {
         .filter(|u| !u.is_empty())
 }
 
+/// Binary-protocol URL of the mTLS broker, when one is in the topology.
+///
+/// That broker demands a trusted client certificate and derives the client's
+/// role from it, so the mTLS tests skip when this is unset.
+/// `scripts/start_test_broker.sh` exports it alongside [`tls_cert_dir`].
+#[cfg(test)]
+pub(crate) fn tls_broker_url() -> Option<String> {
+    std::env::var("PULSAR_TLS_URL")
+        .ok()
+        .map(|u| u.trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+}
+
+/// Directory holding the CA, server and client PEMs the mTLS broker was started
+/// with: `ca.crt`, `client.crt` and `client.key`.
+#[cfg(test)]
+pub(crate) fn tls_cert_dir() -> Option<std::path::PathBuf> {
+    std::env::var("PULSAR_TLS_CERT_DIR")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 /// Admin REST base URL of the broker the integration tests run against.
 ///
 /// Override with `PULSAR_ADMIN_URL`; defaults to the standalone address CI
@@ -71,6 +94,45 @@ pub async fn new_pulsar() -> Pulsar<TokioExecutor> {
         .unwrap()
 }
 
+/// Deletes a non-partitioned topic. Same rationale and same best-effort contract
+/// as [`delete_partitioned_topic`]; `topic_name` is the short name, not a URL.
+#[cfg(test)]
+pub(crate) async fn delete_topic(tenant: &str, namespace: &str, topic_name: &str) {
+    use reqwest::Client;
+
+    let url = format!(
+        "{}/admin/v2/persistent/{tenant}/{namespace}/{topic_name}?force=true",
+        admin_url()
+    );
+    match Client::new().delete(url).send().await {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => log::debug!("could not delete {topic_name}: HTTP {}", response.status()),
+        Err(e) => log::debug!("could not delete {topic_name}: {e}"),
+    }
+}
+
+/// Counterpart to [`create_partitioned_topic`], so a test does not leave its
+/// partitions behind. Worth the call: the suite creates topics faster than a
+/// throwaway broker sheds them, and a broker holding thousands slows down enough
+/// that unrelated tests start failing.
+///
+/// Best-effort — a test that has already failed should report that failure, not
+/// a cleanup error on top of it.
+#[cfg(test)]
+pub(crate) async fn delete_partitioned_topic(tenant: &str, namespace: &str, topic_name: &str) {
+    use reqwest::Client;
+
+    let url = format!(
+        "{}/admin/v2/persistent/{tenant}/{namespace}/{topic_name}/partitions?force=true",
+        admin_url()
+    );
+    match Client::new().delete(url).send().await {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => log::debug!("could not delete {topic_name}: HTTP {}", response.status()),
+        Err(e) => log::debug!("could not delete {topic_name}: {e}"),
+    }
+}
+
 #[cfg(test)]
 pub(crate) async fn create_partitioned_topic(
     tenant: &str,
@@ -91,5 +153,14 @@ pub(crate) async fn create_partitioned_topic(
         .send()
         .await
         .unwrap();
-    assert!(response.status().is_success());
+    // Status *and* body: a bare `is_success()` assertion says only that topic
+    // creation failed, which is not enough to tell a name collision from a broker
+    // that is refusing work.
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        panic!(
+            "creating {topic_name} with {num_partitions} partitions failed: HTTP {status}: {body}"
+        );
+    }
 }

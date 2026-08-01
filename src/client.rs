@@ -10,7 +10,8 @@ use futures::{
 use crate::{
     connection::{Authentication, BrokerFeatures},
     connection_manager::{
-        BrokerAddress, ConnectionManager, ConnectionRetryOptions, OperationRetryOptions, TlsOptions,
+        BrokerAddress, ClientIdentity, ConnectionManager, ConnectionRetryOptions,
+        OperationRetryOptions, TlsOptions,
     },
     consumer::{ConsumerBuilder, ConsumerOptions, InitialPosition},
     error::{ConnectionError, Error},
@@ -486,11 +487,32 @@ impl<Exe: Executor> Pulsar<Exe> {
         Ok(SendFuture(future))
     }
 
+    /// Capabilities the broker advertised during the connection handshake.
+    ///
+    /// Useful for deciding whether an optional protocol feature can be used
+    /// before attempting it. Brokers that predate a flag report it as `false`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # async fn run(pulsar: pulsar::Pulsar<pulsar::TokioExecutor>) -> Result<(), pulsar::Error> {
+    /// if pulsar.broker_features().await?.supports_scalable_topics {
+    ///     // the broker speaks the Pulsar 5.0 `topic://` protocol
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub async fn broker_features(&self) -> Result<BrokerFeatures, Error> {
+        let connection = self.manager.get_base_connection().await?;
+        Ok(connection.sender().broker_features())
+    }
+
     /// Creates an [`AdminClient`][crate::AdminClient] for this cluster.
     ///
     /// The admin client reuses the TLS and authentication configuration
     /// already present on this `Pulsar` instance. Requires one of the
-    /// `admin-api` feature flag. Works under any executor: requests run on the
+    /// `admin-api` feature. Works under any executor: requests run on the
     /// ambient Tokio runtime when there is one, and on a small runtime the client
     /// owns otherwise, so `async-std` callers are supported.
     ///
@@ -513,28 +535,6 @@ impl<Exe: Executor> Pulsar<Exe> {
     /// # Ok(())
     /// # }
     /// ```
-    /// Capabilities the broker advertised during the connection handshake.
-    ///
-    /// Useful for deciding whether an optional protocol feature can be used
-    /// before attempting it. Brokers that predate a flag report it as `false`.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// # async fn run(pulsar: pulsar::Pulsar<pulsar::TokioExecutor>) -> Result<(), pulsar::Error> {
-    /// if pulsar.broker_features().await?.supports_scalable_topics {
-    ///     // the broker speaks the Pulsar 5.0 `topic://` protocol
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    pub async fn broker_features(&self) -> Result<BrokerFeatures, Error> {
-        let connection = self.manager.get_base_connection().await?;
-        Ok(connection.sender().broker_features())
-    }
-
-    /// An admin client for `admin_url`, reusing this client's TLS and auth.
     #[cfg(feature = "admin-api")]
     pub fn admin(&self, admin_url: impl Into<String>) -> Result<crate::AdminClient, Error> {
         crate::admin::AdminClient::new(
@@ -666,6 +666,58 @@ impl<Exe: Executor> PulsarBuilder<Exe> {
         Ok(self.with_certificate_chain(v))
     }
 
+    /// Presents a client certificate to the broker, for mTLS-authenticated
+    /// clusters.
+    ///
+    /// Both arguments are PEM: the certificate chain leaf-first, and the private
+    /// key as PKCS#8, PKCS#1 or SEC1. This is Java's `tlsCertificateFilePath` /
+    /// `tlsKeyFilePath` pair, and what its `AuthenticationTls` provider supplies.
+    ///
+    /// A broker with `tlsRequireTrustedClientCertOnConnect` set refuses a client
+    /// that offers no certificate, and one with `AuthenticationProviderTls`
+    /// derives the client's role from the certificate's subject — so this is
+    /// authentication, not just transport security, and it is unrelated to
+    /// [`with_certificate_chain`][Self::with_certificate_chain], which supplies
+    /// the roots used to verify the *broker*.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    pub fn with_client_identity(
+        mut self,
+        certificate_chain: Vec<u8>,
+        private_key: Vec<u8>,
+    ) -> Self {
+        let identity = ClientIdentity {
+            certificate_chain,
+            private_key,
+        };
+        match &mut self.tls_options {
+            Some(tls) => tls.client_identity = Some(identity),
+            None => {
+                self.tls_options = Some(TlsOptions {
+                    client_identity: Some(identity),
+                    ..Default::default()
+                })
+            }
+        }
+        self
+    }
+
+    /// [`with_client_identity`][Self::with_client_identity], reading both PEMs
+    /// from disk.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    // Two type parameters, not one: sharing `P` would force both paths to be the
+    // same type, so a `PathBuf` for one and a `&str` for the other would not
+    // compile.
+    pub fn with_client_identity_files<C: AsRef<std::path::Path>, K: AsRef<std::path::Path>>(
+        self,
+        certificate_chain: C,
+        private_key: K,
+    ) -> Result<Self, std::io::Error> {
+        let certificate_chain = std::fs::read(certificate_chain)?;
+        let private_key = std::fs::read(private_key)?;
+
+        Ok(self.with_client_identity(certificate_chain, private_key))
+    }
+
     /// The internal pending queue size for each producer on a topic partition. (default: 100)
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn with_outbound_channel_size(mut self, size: usize) -> Self {
@@ -682,11 +734,10 @@ impl<Exe: Executor> PulsarBuilder<Exe> {
     /// cannot dial. The name must match a key the broker was configured with;
     /// an unknown one fails the lookup rather than falling back.
     ///
-    /// Note that the broker reports that mismatch as `ServiceNotReady`, which
-    /// lookup retries indefinitely under the default
-    /// [`OperationRetryOptions`][crate::connection_manager::OperationRetryOptions].
-    /// A misspelt listener name therefore stalls rather than erroring; set
-    /// `max_retries` if you would rather see the failure.
+    /// The broker reports that mismatch as `ServiceNotReady`, which lookup retries
+    /// — so a misspelt name surfaces only once
+    /// [`OperationRetryOptions::operation_timeout`][crate::connection_manager::OperationRetryOptions::operation_timeout]
+    /// elapses, 30 seconds by default, rather than immediately.
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn with_listener_name<S: Into<String>>(mut self, listener_name: S) -> Self {
         self.listener_name = Some(listener_name.into());

@@ -52,7 +52,60 @@ pub struct ConsumerEngine<Exe: Executor> {
     options: ConsumerOptions,
 }
 
+/// Whether `topic` names a persistent topic, by Java's `TopicName` rules.
+///
+/// Only an explicit `non-persistent://` prefix makes a topic non-persistent.
+/// A name with no domain at all — `orders`, or `tenant/ns/orders` — is short-hand
+/// the broker expands to the persistent domain, and the scalable domains this
+/// fork supports (`topic://`, `segment://`) are persistent too, which is why this
+/// cannot be written as `starts_with("persistent://")`.
+fn is_persistent_topic(topic: &str) -> bool {
+    !topic.starts_with("non-persistent://")
+}
+
 impl<Exe: Executor> ConsumerEngine<Exe> {
+    /// Whether this message sits at or before `start_message_id` and so must not
+    /// be delivered.
+    ///
+    /// The broker resumes *from* the start id rather than after it, so without
+    /// this the caller gets the message they named — which, when that id is the
+    /// last one they processed, is a duplicate. Java drops it client-side in
+    /// `ConsumerImpl` (`isSameEntry` + `isPriorEntryIndex`/`isPriorBatchIndex`),
+    /// and `startMessageIdInclusive()` is what keeps it.
+    ///
+    /// Only the start entry itself is ever a candidate: everything before it is
+    /// already excluded by where the broker starts reading. Within that entry a
+    /// batch is split further by batch index.
+    ///
+    /// Non-persistent topics are never filtered, matching Java — they carry no
+    /// durable position, so there is nothing to resume relative to.
+    #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
+    fn is_before_start_message(&self, message_id: &MessageIdData) -> bool {
+        if !is_persistent_topic(&self.topic) {
+            return false;
+        }
+        let Some(start) = self.options.start_message_id.as_ref() else {
+            return false;
+        };
+        if message_id.ledger_id != start.ledger_id || message_id.entry_id != start.entry_id {
+            return false;
+        }
+
+        let inclusive = self.options.start_message_id_inclusive;
+        match (message_id.batch_index, start.batch_index) {
+            (Some(index), Some(start_index)) => {
+                if inclusive {
+                    index < start_index
+                } else {
+                    index <= start_index
+                }
+            }
+            // Same entry, and no batch index to separate them further: the message
+            // *is* the start message.
+            _ => !inclusive,
+        }
+    }
+
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     pub fn new(
         client: Pulsar<Exe>,
@@ -548,6 +601,14 @@ impl<Exe: Executor> ConsumerEngine<Exe> {
             vec![(message.message_id, payload)]
         };
         for (message_id, payload) in payloads {
+            if self.is_before_start_message(&message_id) {
+                trace!(
+                    "dropping {}:{} from before start_message_id",
+                    message_id.ledger_id,
+                    message_id.entry_id
+                );
+                continue;
+            }
             match (message.redelivery_count, &self.dead_letter_policy) {
                 (Some(redelivery_count), Some(dead_letter_policy))
                     if redelivery_count as usize >= dead_letter_policy.max_redeliver_count =>
@@ -773,5 +834,31 @@ mod chunk_tests {
             rendered.contains("chunk") && rendered.contains("4"),
             "unhelpful error text: {rendered}"
         );
+    }
+}
+
+#[cfg(test)]
+mod topic_domain_tests {
+    use super::is_persistent_topic;
+
+    /// The start-message filter is skipped for non-persistent topics, so getting
+    /// this wrong silently disables it — which a short topic name did, because it
+    /// carries no domain at all and the broker expands it to `persistent://`.
+    #[test]
+    fn only_an_explicit_non_persistent_prefix_is_non_persistent() {
+        for topic in [
+            "persistent://public/default/orders",
+            "orders",
+            "public/default/orders",
+            "orders-partition-0",
+            "topic://public/default/orders",
+            "segment://public/default/orders",
+        ] {
+            assert!(is_persistent_topic(topic), "{topic} is persistent");
+        }
+
+        assert!(!is_persistent_topic(
+            "non-persistent://public/default/orders"
+        ));
     }
 }

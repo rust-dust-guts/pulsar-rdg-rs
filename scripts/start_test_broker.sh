@@ -15,7 +15,7 @@
 #
 #   broker_env=$(scripts/start_test_broker.sh) && eval "$broker_env"
 #   cargo test --features admin-api
-#   docker rm -f pulsar-rs-test pulsar-rs-test-proxy
+#   docker rm -f pulsar-rs-test pulsar-rs-test-proxy pulsar-rs-test-tls
 #
 # Environment:
 #   PULSAR_IMAGE_TAG    image tag to run          (default: 5.0.0-M1)
@@ -23,14 +23,20 @@
 #   PULSAR_ADMIN_PORT   fixed admin port          (default: random free port)
 #   PULSAR_PROXY_PORT   fixed proxy service port  (default: random free port)
 #   PULSAR_PROXY_WEB_PORT fixed proxy web port     (default: random free port)
+#   PULSAR_TLS_PORT     fixed mTLS broker port    (default: random free port)
 #   CONTAINER_NAME      docker container name     (default: pulsar-rs-test)
 #   SKIP_PROXY          set to 1 to skip the proxy (proxy-stats tests then skip)
+#   SKIP_TLS            set to 1 to skip the mTLS broker (mTLS tests then skip)
 
 set -euo pipefail
 
 IMAGE_TAG="${PULSAR_IMAGE_TAG:-5.0.0-M1}"
 CONTAINER_NAME="${CONTAINER_NAME:-pulsar-rs-test}"
 PROXY_NAME="${CONTAINER_NAME}-proxy"
+TLS_NAME="${CONTAINER_NAME}-tls"
+# The client certificate's CN, which AuthenticationProviderTls turns into the
+# Pulsar role. The tests assert on it, so both sides read it from here.
+TLS_CLIENT_ROLE="pulsar-rs-test-client"
 
 free_port() {
   python3 - <<'PY'
@@ -65,11 +71,25 @@ PROXY_PORT="${PULSAR_PROXY_PORT:-$(distinct_port "$BROKER_PORT" "$ADMIN_PORT")}"
 PROXY_WEB_PORT="${PULSAR_PROXY_WEB_PORT:-$(distinct_port "$BROKER_PORT" "$ADMIN_PORT" "$PROXY_PORT")}"
 
 echo "# starting apachepulsar/pulsar:${IMAGE_TAG} as ${CONTAINER_NAME}" >&2
-docker rm -f "${CONTAINER_NAME}" "${PROXY_NAME}" >/dev/null 2>&1 || true
+docker rm -f "${CONTAINER_NAME}" "${PROXY_NAME}" "${TLS_NAME}" >/dev/null 2>&1 || true
 
 # The proxy's ports are published here, not on the proxy container: the proxy
 # joins this container's network namespace (see below) and only the container that
 # owns a namespace can publish ports into it.
+#
+# Inactive-topic GC is off, because on it deletes topics a running test is still
+# using: the sweep fences the topic and the test's own cleanup delete then fails
+# with HTTP 500 "Topic is already fenced", a different test losing the race each
+# run. That mechanism is the reason, not a measured failure rate — run-to-run
+# variance here is far too wide to rank configurations by counting failures over
+# a handful of runs.
+#
+# Turning GC off used to mean the suite leaked ~80 topics per run, and a broker
+# holding thousands of them got slow enough that unrelated tests began to fail —
+# flakiness that was really the topology rotting. The tests now delete the topics
+# they create, so a run leaves none behind and that cost is gone. A suite killed
+# part-way still skips its cleanup, so if a container ever does accumulate, just
+# re-run this script for a fresh one.
 #
 # `advertisedListeners` names one extra listener, "external", pointing at the same
 # address the broker already advertises. It exists for the listener-name tests and
@@ -86,6 +106,7 @@ docker run -d --name "${CONTAINER_NAME}" \
   -e PULSAR_PREFIX_topicLevelPoliciesEnabled=true \
   -e PULSAR_PREFIX_systemTopicEnabled=true \
   -e PULSAR_PREFIX_allowAutoTopicCreation=true \
+  -e PULSAR_PREFIX_brokerDeleteInactiveTopicsEnabled=false \
   -e PULSAR_PREFIX_brokerDeduplicationEnabled=true \
   -e PULSAR_PREFIX_transactionCoordinatorEnabled=true \
   -e PULSAR_PREFIX_forceDeleteNamespaceAllowed=true \
@@ -147,8 +168,7 @@ if [ "${SKIP_PROXY:-0}" = "1" ]; then
   echo "# SKIP_PROXY set; proxy-stats tests will skip" >&2
   echo "unset PULSAR_PROXY_URL"
   echo "unset PULSAR_PROXY_ADMIN_URL"
-  exit 0
-fi
+else
 
 echo "# starting proxy as ${PROXY_NAME} (web ${PROXY_WEB_PORT})" >&2
 docker run -d --name "${PROXY_NAME}" --network "container:${CONTAINER_NAME}" \
@@ -169,7 +189,8 @@ for _ in $(seq 1 90); do
     echo "# proxy ready" >&2
     echo "export PULSAR_PROXY_URL=pulsar://127.0.0.1:${PROXY_PORT}"
     echo "export PULSAR_PROXY_ADMIN_URL=http://127.0.0.1:${PROXY_WEB_PORT}"
-    exit 0
+    PROXY_READY=1
+    break
   fi
   if [ "$(docker inspect -f '{{.State.Running}}' "${PROXY_NAME}" 2>/dev/null)" != "true" ]; then
     break
@@ -177,7 +198,127 @@ for _ in $(seq 1 90); do
   sleep 1
 done
 
-echo "# proxy did not become ready. Recent logs:" >&2
-docker logs --tail=40 "${PROXY_NAME}" >&2 || true
-echo "# (set SKIP_PROXY=1 to run the broker alone and skip the proxy-stats tests)" >&2
+if [ "${PROXY_READY:-0}" != "1" ]; then
+  echo "# proxy did not become ready. Recent logs:" >&2
+  docker logs --tail=40 "${PROXY_NAME}" >&2 || true
+  echo "# (set SKIP_PROXY=1 to run the broker alone and skip the proxy-stats tests)" >&2
+  exit 1
+fi
+
+fi  # end of proxy block
+
+# ---------------------------------------------------------------------------
+# mTLS broker
+#
+# A second standalone, TLS-only, that demands a trusted client certificate and
+# derives the client's Pulsar role from its subject. It is separate from the
+# main broker because turning on `authenticationEnabled` there would make every
+# other test authenticate, and the client-certificate tests need a broker that
+# *refuses* an anonymous connection — that refusal is what proves the client
+# actually presented its certificate.
+#
+# The functions worker is off: it drives its own admin client over plain HTTP,
+# where no client certificate can be offered, so it 401s in a loop and the
+# broker never finishes starting.
+# ---------------------------------------------------------------------------
+
+if [ "${SKIP_TLS:-0}" = "1" ]; then
+  echo "# skipping the mTLS broker (SKIP_TLS=1); the mTLS tests will skip" >&2
+  echo "unset PULSAR_TLS_URL PULSAR_TLS_CERT_DIR"
+  exit 0
+fi
+
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "# openssl not found, skipping the mTLS broker; the mTLS tests will skip" >&2
+  echo "unset PULSAR_TLS_URL PULSAR_TLS_CERT_DIR"
+  exit 0
+fi
+
+TLS_PORT="${PULSAR_TLS_PORT:-$(distinct_port "$BROKER_PORT" "$ADMIN_PORT" "$PROXY_PORT" "$PROXY_WEB_PORT")}"
+CERT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pulsar-rs-tls.XXXXXX")"
+chmod 755 "${CERT_DIR}"
+
+# Leaf certificates get 365 days, not the 3650 that is habitual for throwaway
+# test certs: Apple's Security framework — which native-tls uses on macOS —
+# rejects a server certificate whose validity exceeds 398 days outright, with
+# "The validity period in the certificate exceeds the maximum allowed."
+#
+# Both leaves also carry an explicit extendedKeyUsage. Security.framework rejects
+# a server certificate without serverAuth with "The extended key usage is not
+# valid.", and `openssl x509 -req` adds no extensions unless told to.
+echo "# generating a CA, a server certificate for 127.0.0.1 and a client certificate" >&2
+(
+  cd "${CERT_DIR}"
+  openssl req -x509 -newkey rsa:2048 -days 3650 -nodes -keyout ca.key -out ca.crt \
+    -subj "/CN=pulsar-rs-test-ca"
+  openssl req -newkey rsa:2048 -nodes -keyout server.key.pkcs1 -out server.csr \
+    -subj "/CN=127.0.0.1"
+  openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 \
+    -out server.crt -extfile <(printf "%s\n" \
+      "basicConstraints=CA:FALSE" \
+      "keyUsage=digitalSignature,keyEncipherment" \
+      "extendedKeyUsage=serverAuth" \
+      "subjectAltName=IP:127.0.0.1,DNS:localhost")
+  openssl pkcs8 -topk8 -nocrypt -in server.key.pkcs1 -out server.key
+  # The CN becomes the Pulsar role that AuthenticationProviderTls extracts, which
+  # is why it is also the superuser below.
+  openssl req -newkey rsa:2048 -nodes -keyout client.key.pkcs1 -out client.csr \
+    -subj "/CN=${TLS_CLIENT_ROLE}"
+  openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 \
+    -out client.crt -extfile <(printf "%s\n" \
+      "basicConstraints=CA:FALSE" \
+      "keyUsage=digitalSignature" \
+      "extendedKeyUsage=clientAuth")
+  openssl pkcs8 -topk8 -nocrypt -in client.key.pkcs1 -out client.key
+  chmod 644 ./*.crt ./*.key
+) >/dev/null 2>&1
+
+echo "# starting the mTLS broker as ${TLS_NAME} (port ${TLS_PORT})" >&2
+docker run -d --name "${TLS_NAME}" \
+  -p "${TLS_PORT}:${TLS_PORT}" \
+  -v "${CERT_DIR}:/pulsar/tls:ro" \
+  -e PULSAR_PREFIX_brokerServicePortTls="${TLS_PORT}" \
+  -e PULSAR_PREFIX_webServicePortTls=8443 \
+  -e PULSAR_PREFIX_advertisedAddress=127.0.0.1 \
+  -e PULSAR_PREFIX_tlsCertificateFilePath=/pulsar/tls/server.crt \
+  -e PULSAR_PREFIX_tlsKeyFilePath=/pulsar/tls/server.key \
+  -e PULSAR_PREFIX_tlsTrustCertsFilePath=/pulsar/tls/ca.crt \
+  -e PULSAR_PREFIX_tlsRequireTrustedClientCertOnConnect=true \
+  -e PULSAR_PREFIX_authenticationEnabled=true \
+  -e PULSAR_PREFIX_authenticationProviders=org.apache.pulsar.broker.authentication.AuthenticationProviderTls \
+  -e PULSAR_PREFIX_brokerClientTlsEnabled=true \
+  -e PULSAR_PREFIX_brokerClientTrustCertsFilePath=/pulsar/tls/ca.crt \
+  -e PULSAR_PREFIX_brokerClientAuthenticationPlugin=org.apache.pulsar.client.impl.auth.AuthenticationTls \
+  -e PULSAR_PREFIX_brokerClientAuthenticationParameters="tlsCertFile:/pulsar/tls/client.crt,tlsKeyFile:/pulsar/tls/client.key" \
+  -e PULSAR_PREFIX_superUserRoles="${TLS_CLIENT_ROLE}" \
+  -e PULSAR_PREFIX_allowAutoTopicCreation=true \
+  -e PULSAR_PREFIX_brokerDeleteInactiveTopicsEnabled=false \
+  "apachepulsar/pulsar:${IMAGE_TAG}" \
+  sh -c 'bin/apply-config-from-env.py conf/standalone.conf && bin/pulsar standalone --no-functions-worker' \
+  >/dev/null
+
+for _ in $(seq 1 120); do
+  if openssl s_client -connect "127.0.0.1:${TLS_PORT}" -CAfile "${CERT_DIR}/ca.crt" \
+      -cert "${CERT_DIR}/client.crt" -key "${CERT_DIR}/client.key" </dev/null 2>&1 \
+      | grep -q "Verify return code: 0"; then
+    # The TLS port is bound before the last of the broker's startup checks, so a
+    # successful handshake alone does not mean it is staying up.
+    sleep 2
+    if [ "$(docker inspect -f '{{.State.Running}}' "${TLS_NAME}" 2>/dev/null)" = "true" ]; then
+      echo "# mTLS broker ready" >&2
+      echo "export PULSAR_TLS_URL=pulsar+ssl://127.0.0.1:${TLS_PORT}"
+      echo "export PULSAR_TLS_CERT_DIR=${CERT_DIR}"
+      exit 0
+    fi
+    break
+  fi
+  if [ "$(docker inspect -f '{{.State.Running}}' "${TLS_NAME}" 2>/dev/null)" != "true" ]; then
+    break
+  fi
+  sleep 1
+done
+
+echo "# the mTLS broker did not become ready. Recent logs:" >&2
+docker logs --tail=40 "${TLS_NAME}" >&2 || true
+echo "# (set SKIP_TLS=1 to skip it and the mTLS tests)" >&2
 exit 1

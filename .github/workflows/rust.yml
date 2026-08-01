@@ -194,6 +194,101 @@ jobs:
           docker logs --tail=100 pulsar-proxy || true
           exit 1
 
+      - name: Start mTLS broker
+        # Without this the mTLS tests skip: they are gated on PULSAR_TLS_URL, so a
+        # missing broker means `with_client_identity` — and every TLS backend it
+        # touches — ships with no CI coverage at all.
+        #
+        # Keep in step with the TLS section of scripts/start_test_broker.sh. The
+        # client certificate's CN becomes the Pulsar role that
+        # AuthenticationProviderTls extracts, which is why it is also the superuser.
+        #
+        # Deliberately not fatal. This runs across seven Pulsar versions back to
+        # 2.11, and a TLS option an old broker rejects should cost the mTLS
+        # coverage on that version, not fail the whole matrix leg — the tests
+        # already skip when the variables are unset. A failure here is loud in the
+        # log and the summary line below says which way it went.
+        shell: bash
+        run: |
+          set -uo pipefail
+          CERT_DIR="${{ github.workspace }}/tls-certs"
+          # Both guarded: this step deliberately runs without `set -e` so it can
+          # never fail the job, which also means a failed `mkdir` or `cd` would
+          # otherwise fall through and openssl would scatter keys across the
+          # working directory instead.
+          mkdir -p "$CERT_DIR" || {
+            echo "::warning::could not create $CERT_DIR; mTLS tests will skip"; exit 0; }
+
+          # Leaves get 365 days, not the habitual 3650: Apple's Security framework
+          # rejects a server certificate valid for more than 398 days, and the same
+          # certificates are used by the local script on macOS.
+          (
+            cd "$CERT_DIR" || exit 1
+            openssl req -x509 -newkey rsa:2048 -days 3650 -nodes -keyout ca.key -out ca.crt \
+              -subj "/CN=pulsar-rs-test-ca"
+            openssl req -newkey rsa:2048 -nodes -keyout server.key.pkcs1 -out server.csr \
+              -subj "/CN=127.0.0.1"
+            openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 \
+              -out server.crt -extfile <(printf "%s\n" \
+                "basicConstraints=CA:FALSE" \
+                "keyUsage=digitalSignature,keyEncipherment" \
+                "extendedKeyUsage=serverAuth" \
+                "subjectAltName=IP:127.0.0.1,DNS:localhost")
+            openssl pkcs8 -topk8 -nocrypt -in server.key.pkcs1 -out server.key
+            openssl req -newkey rsa:2048 -nodes -keyout client.key.pkcs1 -out client.csr \
+              -subj "/CN=pulsar-rs-test-client"
+            openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 365 \
+              -out client.crt -extfile <(printf "%s\n" \
+                "basicConstraints=CA:FALSE" \
+                "keyUsage=digitalSignature" \
+                "extendedKeyUsage=clientAuth")
+            openssl pkcs8 -topk8 -nocrypt -in client.key.pkcs1 -out client.key
+            chmod 644 ./*.crt ./*.key
+          ) || { echo "::warning::certificate generation failed; mTLS tests will skip"; exit 0; }
+
+          docker run -d --name pulsar-tls \
+            -p 6651:6651 \
+            -v "$CERT_DIR:/pulsar/tls:ro" \
+            -e PULSAR_PREFIX_brokerServicePortTls=6651 \
+            -e PULSAR_PREFIX_webServicePortTls=8443 \
+            -e PULSAR_PREFIX_advertisedAddress=127.0.0.1 \
+            -e PULSAR_PREFIX_tlsCertificateFilePath=/pulsar/tls/server.crt \
+            -e PULSAR_PREFIX_tlsKeyFilePath=/pulsar/tls/server.key \
+            -e PULSAR_PREFIX_tlsTrustCertsFilePath=/pulsar/tls/ca.crt \
+            -e PULSAR_PREFIX_tlsRequireTrustedClientCertOnConnect=true \
+            -e PULSAR_PREFIX_authenticationEnabled=true \
+            -e PULSAR_PREFIX_authenticationProviders=org.apache.pulsar.broker.authentication.AuthenticationProviderTls \
+            -e PULSAR_PREFIX_brokerClientTlsEnabled=true \
+            -e PULSAR_PREFIX_brokerClientTrustCertsFilePath=/pulsar/tls/ca.crt \
+            -e PULSAR_PREFIX_brokerClientAuthenticationPlugin=org.apache.pulsar.client.impl.auth.AuthenticationTls \
+            -e PULSAR_PREFIX_brokerClientAuthenticationParameters="tlsCertFile:/pulsar/tls/client.crt,tlsKeyFile:/pulsar/tls/client.key" \
+            -e PULSAR_PREFIX_superUserRoles=pulsar-rs-test-client \
+            -e PULSAR_PREFIX_allowAutoTopicCreation=true \
+            -e PULSAR_PREFIX_brokerDeleteInactiveTopicsEnabled=false \
+            apachepulsar/pulsar:${{ matrix.pulsar-version }} \
+            sh -c 'bin/apply-config-from-env.py conf/standalone.conf && bin/pulsar standalone --no-functions-worker' \
+            || { echo "::warning::mTLS broker failed to start; mTLS tests will skip"; exit 0; }
+
+          deadline=$(( SECONDS + 240 ))
+          while (( SECONDS < deadline )); do
+            if openssl s_client -connect 127.0.0.1:6651 -CAfile "$CERT_DIR/ca.crt" \
+                 -cert "$CERT_DIR/client.crt" -key "$CERT_DIR/client.key" \
+                 </dev/null 2>/dev/null | grep -q "Verify return code: 0"; then
+              echo "PULSAR_TLS_URL=pulsar+ssl://127.0.0.1:6651" >> "$GITHUB_ENV"
+              echo "PULSAR_TLS_CERT_DIR=$CERT_DIR" >> "$GITHUB_ENV"
+              echo "mTLS broker ready after ${SECONDS}s; mTLS tests will run"
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' pulsar-tls 2>/dev/null)" != "true" ]; then
+              echo "::warning::mTLS broker exited; mTLS tests will skip"
+              docker logs --tail=60 pulsar-tls || true
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::warning::mTLS broker not ready after ${SECONDS}s; mTLS tests will skip"
+          docker logs --tail=60 pulsar-tls || true
+
       - name: Run tests (serial, verbose)
         env:
           RUST_BACKTRACE: 1
@@ -230,5 +325,5 @@ jobs:
 
       - name: Stop Pulsar
         if: always()
-        run: docker rm -f pulsar-proxy pulsar || true
+        run: docker rm -f pulsar-proxy pulsar-tls pulsar || true
 

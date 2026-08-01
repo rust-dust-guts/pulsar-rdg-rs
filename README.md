@@ -50,6 +50,10 @@ Added in this fork:
 - **PIP-344 partition metadata lookup without topic auto-creation**;
 - **Advertised listener selection** — `PulsarBuilder::with_listener_name`, so a client outside the
   broker's own network gets an address it can reach instead of an internal one;
+- **Reader primitives** — `Reader::has_message_available`, so "drain the topic, then stop" can be
+  written at all;
+- **mTLS client authentication** — `PulsarBuilder::with_client_identity`, so mTLS-authenticated
+  clusters are reachable; works under all four TLS backends;
 - **Producers and consumers follow a topic as it grows** — adding partitions to a live topic used to
   strand the new ones: they got no traffic, and keyed messages landed on a different partition than
   a Java client would pick. Both sides now re-check, as Java's `autoUpdatePartitions` does;
@@ -92,10 +96,30 @@ prints the environment the suite reads:
 broker_env=$(./scripts/start_test_broker.sh) && eval "$broker_env" && cargo test --features admin-api
 ```
 
-Clean up with `docker rm -f pulsar-rs-test pulsar-rs-test-proxy`. Set `SKIP_PROXY=1` to start the
-broker alone; the `proxy-stats` tests then skip. All four of `PULSAR_BROKER_URL`, `PULSAR_ADMIN_URL`,
-`PULSAR_PROXY_URL` and `PULSAR_PROXY_ADMIN_URL` can also be set by hand to point at existing
-services.
+The topology is three containers: the broker, a proxy in front of it for the `proxy-stats` tests, and
+a second TLS-only broker that demands a client certificate for the mTLS tests. The script generates a
+throwaway CA and certificates for that last one.
+
+The tests run four at a time, not one per core: they share a single broker, and Rust's default
+overruns it — about one run in twenty failed on a 12-core machine, each time on a different test and
+never reproducibly on its own. `.cargo/config.toml` sets `RUST_TEST_THREADS = "4"`, which costs a few
+seconds and held across every run measured. Export the variable yourself to override it; CI does,
+running fully serial:
+
+```bash
+RUST_TEST_THREADS=1 cargo test --features admin-api
+```
+
+Slower (~2 minutes), and the configuration CI actually gates on.
+
+The suite cleans up after itself — a run leaves no topics behind — so a container can take many runs
+without degrading. If one ever does accumulate (a suite killed part-way skips its cleanup), re-run the
+script for a fresh one.
+
+Clean up with `docker rm -f pulsar-rs-test pulsar-rs-test-proxy pulsar-rs-test-tls`. `SKIP_PROXY=1`
+and `SKIP_TLS=1` start without the proxy or the mTLS broker; the tests that need them then skip.
+`PULSAR_BROKER_URL`, `PULSAR_ADMIN_URL`, `PULSAR_PROXY_URL`, `PULSAR_PROXY_ADMIN_URL`,
+`PULSAR_TLS_URL` and `PULSAR_TLS_CERT_DIR` can also be set by hand to point at existing services.
 
 ## Upgrading from upstream `pulsar-rs` 6.x
 
@@ -140,6 +164,41 @@ Producers re-check every 60 seconds by default, matching Java's `autoUpdateParti
 runs on the next send after the interval elapses, so an idle producer costs nothing. Configure it
 with `ProducerBuilder::with_partition_refresh`, or turn it off with `without_partition_refresh`.
 Consumers use the existing `ConsumerBuilder::with_topic_refresh` interval (30 seconds by default).
+
+### `start_message_id` no longer redelivers the start message
+
+`ConsumerOptions::start_message_id` is a resume cursor, and reading now begins at the message *after*
+it — which is what Java does, and what makes "store the id I last processed, restart from it" correct.
+Previously that message came back, so a resume processed it twice.
+
+Set `start_message_id_inclusive: true` for the old behaviour; it is Java's `startMessageIdInclusive()`.
+Only persistent topics are filtered, matching Java.
+
+### Message ids of batched messages now carry `batch_size`
+
+A message unpacked from a batch reports `batch_size` alongside `batch_index`, and that field travels
+on acknowledgements too — as it does in Java, whose `Commands.newAck` sets it. This is what lets
+`has_message_available` tell a partly-read batch from a fully-read one: every message in a batch
+shares a single entry, so comparing positions alone cannot see the remainder.
+
+`Reader` is also now re-exported at the crate root, so `pulsar::Reader` works alongside
+`pulsar::Consumer` and `pulsar::Producer`.
+
+### Admin request timeout raised to 60 seconds
+
+`AdminOptions::timeout` now defaults to 60 seconds rather than 30, matching Java's `requestTimeoutMs`.
+A broker servicing concurrent admin work can exceed 30 seconds on topic-policy operations, and giving
+up at half of Java's allowance surfaced as sporadic `TimedOut` request errors.
+
+### Topic lookup now gives up
+
+`OperationRetryOptions::operation_timeout` (30s by default) now bounds lookup retries. It was
+documented as "time limit to receive an answer to a Pulsar operation" but the lookup loop ignored it,
+and `max_retries` defaults to `None`, so a lookup the broker would never satisfy — a listener name it
+has no entry for, say — retried every 5 seconds indefinitely instead of returning an error.
+
+Java does not retry a failed lookup at all. If you relied on unlimited retries to ride out a long
+broker startup, raise `operation_timeout`.
 
 ### Admin API source breaks
 

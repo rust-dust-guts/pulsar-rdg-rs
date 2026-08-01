@@ -2012,9 +2012,10 @@ mod tests {
             .build()
             .await
             .unwrap();
+        let unbounded_topic = format!("block_queue_if_full_{}", rand::random::<u32>());
         let mut producer = pulsar
             .producer()
-            .with_topic(format!("block_queue_if_full_{}", rand::random::<u16>()))
+            .with_topic(&unbounded_topic)
             .build()
             .await
             .unwrap();
@@ -2035,9 +2036,10 @@ mod tests {
         info!("Messages failed due to SlowDown: {:?}", &failed_indexes);
         assert!(!failed_indexes.is_empty());
 
+        let blocking_topic = format!("block_queue_if_full_{}", rand::random::<u32>());
         let mut producer = pulsar
             .producer()
-            .with_topic(format!("block_queue_if_full_{}", rand::random::<u16>()))
+            .with_topic(&blocking_topic)
             .with_options(ProducerOptions {
                 block_queue_if_full: true,
                 ..Default::default()
@@ -2055,6 +2057,8 @@ mod tests {
                 Err(e) => panic!("failed to send {}: {}", i, e),
             }
         }
+        test_utils::delete_topic("public", "default", &unbounded_topic).await;
+        test_utils::delete_topic("public", "default", &blocking_topic).await;
     }
 
     #[tokio::test]
@@ -2066,17 +2070,14 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let mut producer = pulsar
-            .producer()
-            .with_topic(format!("topic_{}", rand::random::<u16>()))
-            .build()
-            .await
-            .unwrap();
+        let topic = format!("topic_{}", rand::random::<u32>());
+        let mut producer = pulsar.producer().with_topic(&topic).build().await.unwrap();
         let (sender, receiver) = oneshot::channel();
         let _ = pulsar.executor.spawn(Box::pin(async move {
             sender.send(producer.close().await).unwrap();
         }));
         assert!(receiver.await.is_ok());
+        test_utils::delete_topic("public", "default", &topic).await;
     }
 
     #[tokio::test]
@@ -2087,7 +2088,11 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let topic = format!("topic_{}", rand::random::<u16>());
+        // A 32-bit suffix, not the 16-bit one used elsewhere in the suite: this
+        // topic is created through the admin API, which rejects a name that
+        // already exists with HTTP 409 "This topic already exists" rather than
+        // reusing it, so a collision fails the test outright.
+        let topic = format!("topic_{}", rand::random::<u32>());
         let options = ProducerOptions {
             routing_policy: Some(RoutingPolicy::RoundRobin),
             ..Default::default()
@@ -2097,7 +2102,7 @@ mod tests {
 
         let mut producer = pulsar
             .producer()
-            .with_topic(topic)
+            .with_topic(&topic)
             .with_options(options)
             .build()
             .await
@@ -2147,6 +2152,7 @@ mod tests {
 
             assert!(send_receipt.producer_id == producer_id);
         }
+        test_utils::delete_partitioned_topic("public", "default", &topic).await;
     }
 
     #[tokio::test]
@@ -2157,7 +2163,11 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let topic = format!("topic_{}", rand::random::<u16>());
+        // A 32-bit suffix, not the 16-bit one used elsewhere in the suite: this
+        // topic is created through the admin API, which rejects a name that
+        // already exists with HTTP 409 "This topic already exists" rather than
+        // reusing it, so a collision fails the test outright.
+        let topic = format!("topic_{}", rand::random::<u32>());
         let options = ProducerOptions {
             routing_policy: Some(RoutingPolicy::Single),
             ..Default::default()
@@ -2167,7 +2177,7 @@ mod tests {
 
         let mut producer = pulsar
             .producer()
-            .with_topic(topic)
+            .with_topic(&topic)
             .with_options(options)
             .build()
             .await
@@ -2202,6 +2212,7 @@ mod tests {
 
             assert!(send_receipt.producer_id == producer_id);
         }
+        test_utils::delete_partitioned_topic("public", "default", &topic).await;
     }
 
     /// Produces a keyed message per golden vector and asserts the broker
@@ -2378,6 +2389,7 @@ mod tests {
             got, want,
             "{hashing_scheme:?}: keys landed on different partitions than the Java client would pick"
         );
+        test_utils::delete_partitioned_topic("public", "default", &topic).await;
     }
 
     #[tokio::test]
@@ -2552,6 +2564,7 @@ mod tests {
         assert_eq!(null_key.partition_key, None);
 
         producer.close().await.unwrap();
+        test_utils::delete_topic("public", "default", topic.rsplit('/').next().unwrap()).await;
     }
     #[tokio::test]
     async fn test_custom_routing_policy() {
@@ -2561,7 +2574,11 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let topic = format!("topic_{}", rand::random::<u16>());
+        // A 32-bit suffix, not the 16-bit one used elsewhere in the suite: this
+        // topic is created through the admin API, which rejects a name that
+        // already exists with HTTP 409 "This topic already exists" rather than
+        // reusing it, so a collision fails the test outright.
+        let topic = format!("topic_{}", rand::random::<u32>());
         let options = ProducerOptions {
             routing_policy: Some(RoutingPolicy::Custom(Arc::new(TestCustomRoutingPolicy {}))),
             ..Default::default()
@@ -2571,7 +2588,7 @@ mod tests {
 
         let mut producer = pulsar
             .producer()
-            .with_topic(topic)
+            .with_topic(&topic)
             .with_options(options)
             .build()
             .await
@@ -2606,6 +2623,7 @@ mod tests {
 
             assert!(send_receipt.producer_id == producer_id);
         }
+        test_utils::delete_partitioned_topic("public", "default", &topic).await;
     }
 
     /// A producer picks up partitions added after it was built.
@@ -2619,7 +2637,10 @@ mod tests {
     /// at all: a one-partition topic used to build a `Single` producer, which has
     /// no partition set to grow.
     #[tokio::test]
-    #[cfg_attr(not(feature = "admin-api"), ignore)]
+    // `cfg`, not `cfg_attr(..., ignore)`: the body uses the admin client, so
+    // without the feature this must not be *compiled*, not merely skipped at run
+    // time. `ignore` alone left `cargo test` failing to build.
+    #[cfg(feature = "admin-api")]
     async fn a_producer_picks_up_partitions_added_after_it_was_built() {
         let _result = log::set_logger(&TEST_LOGGER);
         log::set_max_level(LevelFilter::Debug);
@@ -2692,7 +2713,10 @@ mod tests {
     /// This is the negative control for the test above — it fails if the refresh
     /// ignores its configuration and runs unconditionally.
     #[tokio::test]
-    #[cfg_attr(not(feature = "admin-api"), ignore)]
+    // `cfg`, not `cfg_attr(..., ignore)`: the body uses the admin client, so
+    // without the feature this must not be *compiled*, not merely skipped at run
+    // time. `ignore` alone left `cargo test` failing to build.
+    #[cfg(feature = "admin-api")]
     async fn a_producer_that_opted_out_keeps_its_original_partitions() {
         let _result = log::set_logger(&TEST_LOGGER);
         log::set_max_level(LevelFilter::Debug);

@@ -73,9 +73,10 @@ where
 /// Serializes the `proxy-stats` tests against each other.
 ///
 /// The proxy's log level is process-global: one test lowers it to exercise the
-/// setter, while the traffic test needs level 2 for topic accounting. CI runs with
-/// `--test-threads=1`, but the documented local command uses Rust's parallel
-/// default, where the two would race.
+/// setter, while the traffic test needs level 2 for topic accounting. CI runs
+/// serially (`RUST_TEST_THREADS: 1` in `.github/workflows/rust.yml`), but the
+/// documented local command uses Rust's parallel default, where the two would
+/// race.
 fn proxy_log_level_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -453,7 +454,16 @@ async fn namespace_isolation_policy_round_trip() {
             .into_iter()
             .collect(),
         }),
-        unload_scope: None,
+        // `none` rather than absent, and the difference matters. Left unset, the
+        // broker runs `filterAndUnloadMatchedNamespaceAsync`, which walks *every*
+        // tenant and *every* namespace in the instance — not just the ones this
+        // policy names — calling `getPolicies` on each and unloading the matches.
+        // Against a suite creating and deleting namespaces in parallel that fails
+        // with "Namespace does not exist" when one vanishes mid-walk, and the
+        // unloads fence topics other tests still hold, so their cleanup deletes
+        // fail with "Topic is already fenced". `none` makes the broker return
+        // before any of it.
+        unload_scope: Some("none".to_string()),
     };
 
     admin
@@ -629,11 +639,20 @@ async fn broker_read_only_endpoints() {
         .get_all_dynamic_configurations()
         .await
         .unwrap();
-    admin
-        .brokers()
-        .get_owned_namespaces(&cluster, &brokers[0])
-        .await
-        .unwrap();
+    // Retried, and only this one: the broker iterates its owned-namespace map
+    // without guarding it, so a namespace created or deleted by a concurrent test
+    // makes the handler throw `java.util.ConcurrentModificationException` and
+    // return HTTP 500. That is a defect in Pulsar, not in this client — a
+    // read-only GET is safe to repeat, and the call still has to succeed and
+    // decode, so the assertion keeps its meaning.
+    let brokers_api = admin.brokers();
+    retry_until_ok(
+        "getOwnedNamespaces",
+        5,
+        std::time::Duration::from_millis(200),
+        || brokers_api.get_owned_namespaces(&cluster, &brokers[0]),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1589,6 +1608,90 @@ async fn namespace_boolean_policies_round_trip() {
 
 // -------------------------------------------------------- topic policies
 
+/// Deletes `topic` and makes sure it stays deleted.
+///
+/// The function worker sets its input topic up asynchronously, so a single
+/// delete issued right after the function is removed can land before the worker
+/// has finished creating it — the delete 404s, the worker then creates the topic,
+/// and it outlives the test. Re-checking a few times closes that window.
+async fn delete_topic_for_good(admin: &AdminClient, namespace: &str, topic: &str) {
+    let topics = admin.topics();
+    for _ in 0..6 {
+        topics.delete(topic, true).await.ok();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        match topics.get_list(namespace).await {
+            Ok(list) if !list.iter().any(|t| t == topic) => return,
+            Ok(_) => continue,
+            Err(e) => {
+                log::debug!("could not list {namespace} while cleaning up {topic}: {e}");
+                return;
+            }
+        }
+    }
+    log::debug!("{topic} kept coming back; leaving it");
+}
+
+/// Retries `op` until it succeeds, then returns its value.
+///
+/// Several broker behaviours the suite touches are transiently unavailable rather
+/// than broken — a system topic still initialising, a handler that raced a
+/// concurrent change, a call the broker occasionally stalls. Each needs the same
+/// loop, and writing it out four times made each copy free to forget the part
+/// that matters: reporting the last error when the retries run out.
+async fn retry_until_ok<T, E, F, Fut>(
+    what: &str,
+    attempts: usize,
+    delay: std::time::Duration,
+    mut op: F,
+) -> T
+where
+    E: std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut last_err = None;
+    for _ in 0..attempts {
+        match op().await {
+            Ok(value) => return value,
+            Err(e) => {
+                log::debug!("{what} not ready yet: {e:?}");
+                last_err = Some(e);
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+    panic!("{what} never succeeded in {attempts} attempts; last error: {last_err:?}");
+}
+
+/// Waits until a freshly created namespace will actually accept a topic.
+///
+/// With `topicLevelPoliciesEnabled`, the first topic in a namespace also brings
+/// up that namespace's `__change_events` system topic and the policy reader on
+/// it. Until that settles the broker can answer topic creation with HTTP 500 —
+/// "The subscription __system_reader-… of the topic …/__change_events gets the
+/// last message id was failed" — which fails a test for something it neither did
+/// nor is testing.
+///
+/// Creating and dropping one throwaway topic forces that initialisation to
+/// finish inside the fixture, where a retry is honest, rather than in the body
+/// where every caller would have to handle it.
+async fn warm_up_namespace(admin: &AdminClient, namespace: &str) {
+    let probe = format!("persistent://{namespace}/{}", unique("warmup"));
+    // `topics()` hoisted out of the closure: it returns a borrowing view, and a
+    // temporary created inside would not outlive the future that borrows it.
+    let topics = admin.topics();
+    retry_until_ok(
+        &format!("namespace {namespace} accepting a topic"),
+        20,
+        std::time::Duration::from_millis(150),
+        || topics.create_non_partitioned_topic(&probe),
+    )
+    .await;
+    topics.delete(&probe, true).await.ok();
+}
+
 /// Creates a namespace and a topic inside it, runs `body`, then cleans up.
 ///
 /// Topic policies require the topic to exist, so it is created by attaching a
@@ -1604,6 +1707,7 @@ where
         .create_namespace(&namespace)
         .await
         .unwrap();
+    warm_up_namespace(admin, &namespace).await;
     let topic = format!("persistent://{namespace}/{}", unique("topic"));
 
     let pulsar = crate::Pulsar::<TokioExecutor>::builder(test_utils::broker_url(), TokioExecutor)
@@ -1661,6 +1765,7 @@ async fn topic_policy_overrides_namespace_policy() {
         .create_namespace(&namespace)
         .await
         .unwrap();
+    warm_up_namespace(&admin, &namespace).await;
     let topic = format!("persistent://{namespace}/{}", unique("topic"));
 
     let pulsar = crate::Pulsar::<TokioExecutor>::builder(test_utils::broker_url(), TokioExecutor)
@@ -2135,6 +2240,7 @@ where
         .create_namespace(&namespace)
         .await
         .unwrap();
+    warm_up_namespace(admin, &namespace).await;
     with_cleanup(body(namespace.clone()), || async {
         admin.namespaces().delete_namespace(&namespace, true).await
     })
@@ -4086,9 +4192,17 @@ async fn topic_remaining_operations() {
         // Shadow topics: set, read, remove.
         let shadow = format!("persistent://{ns}/{}", unique("shadow"));
         t.create_non_partitioned_topic(&shadow).await.unwrap();
-        t.set_shadow_topics(&topic, std::slice::from_ref(&shadow))
-            .await
-            .unwrap();
+        // Retried: the broker intermittently stalls this one until the client's
+        // request timeout expires — the failure is `TimedOut`, with no response at
+        // all, so it is not a handler rejection `assert_ok_or_handled!` could
+        // classify. Setting the same shadow list twice is idempotent, so a repeat
+        // is safe, and the round-trip assertions below still have to hold.
+        // No delay between attempts: each one already waited out the client's
+        // request timeout, which is the stall this is retrying.
+        retry_until_ok("set_shadow_topics", 3, std::time::Duration::ZERO, || {
+            t.set_shadow_topics(&topic, std::slice::from_ref(&shadow))
+        })
+        .await;
         assert_eq!(
             t.get_shadow_topics(&topic).await.unwrap(),
             Some(vec![shadow.clone()]),
@@ -4575,10 +4689,17 @@ async fn transaction_coordinator_and_stats_endpoints() {
             .await
             .expect("transactionInPendingAckStats must answer for an existing subscription");
 
-        let internal = txn
-            .get_transaction_buffer_internal_stats(&topic, true)
-            .await
-            .expect("transactionBufferInternalStats must answer for an existing topic");
+        // The transaction buffer creates its `__transaction_buffer_snapshot` system
+        // topic lazily, and until it exists this reports HTTP 500 "Topic ... not
+        // found". Poll rather than assuming it is ready, so the decode assertion
+        // below keeps its teeth instead of being weakened to tolerate the race.
+        let internal = retry_until_ok(
+            "transactionBufferInternalStats",
+            40,
+            std::time::Duration::from_millis(250),
+            || txn.get_transaction_buffer_internal_stats(&topic, true),
+        )
+        .await;
         assert!(
             internal.snapshot_type.is_some(),
             "snapshot type must decode: {internal:?}"
@@ -4776,6 +4897,7 @@ async fn function_create_lifecycle_and_delete() {
         let admin = new_admin().await;
         let f = admin.functions();
         let name = unique("fn");
+        let input_topic = format!("persistent://public/default/{}", unique("fn-in"));
         with_function_cleanup(&name.clone(), async {
             let config = FunctionConfig {
                 tenant: Some("public".to_string()),
@@ -4783,7 +4905,7 @@ async fn function_create_lifecycle_and_delete() {
                 name: Some(name.clone()),
                 class_name: Some("identity".to_string()),
                 runtime: Some("PYTHON".to_string()),
-                inputs: vec![format!("persistent://public/default/{}", unique("fn-in"))],
+                inputs: vec![input_topic.clone()],
                 output: Some(format!("persistent://public/default/{}", unique("fn-out"))),
                 parallelism: Some(1),
                 py: Some("identity.py".to_string()),
@@ -4854,6 +4976,9 @@ async fn function_create_lifecycle_and_delete() {
             }
         })
         .await;
+        // Registering a function auto-creates its input topic; deleting the
+        // function does not remove it.
+        delete_topic_for_good(&admin, "public/default", &input_topic).await;
     })
     .await;
 }
@@ -6696,13 +6821,29 @@ async fn remaining_namespace_parity_operations() {
             n.get_topic_hash_positions(&ns, &bundle, &[]).await
         );
 
+        admin.topics().delete(&topic, true).await.ok();
+
         // --- deleting a single bundle ---
+        //
+        // In a namespace of its own, deleted best-effort. Deleting a bundle fences
+        // every topic it owns, including the `__change_events` system topic the
+        // broker creates for topic-level policies, and a fenced topic cannot be
+        // deleted afterwards — so running this against the shared fixture
+        // namespace leaves that fixture's own `delete_namespace` failing with HTTP
+        // 500 "Topic is already fenced", intermittently failing a test whose body
+        // had already passed.
+        let disposable = format!("public/{}", unique("test_bundle_del"));
+        n.create_namespace(&disposable).await.unwrap();
+        let disposable_bundle = {
+            let boundaries = n.get_bundles(&disposable).await.unwrap().boundaries;
+            format!("{}_{}", boundaries[0], boundaries[1])
+        };
         assert_ok_or_handled!(
             "delete_namespace_bundle",
-            n.delete_namespace_bundle(&ns, &bundle, true).await
+            n.delete_namespace_bundle(&disposable, &disposable_bundle, true)
+                .await
         );
-
-        admin.topics().delete(&topic, true).await.ok();
+        n.delete_namespace(&disposable, true).await.ok();
     })
     .await;
 }
@@ -6992,6 +7133,7 @@ async fn function_stats_decode_the_brokers_nested_instances() {
         let admin = new_admin().await;
         let f = admin.functions();
         let name = unique("fn_stats");
+        let input_topic = format!("persistent://public/default/{}", unique("st-in"));
         with_function_cleanup(&name.clone(), async {
             let config = FunctionConfig {
                 tenant: Some("public".to_string()),
@@ -6999,7 +7141,7 @@ async fn function_stats_decode_the_brokers_nested_instances() {
                 name: Some(name.clone()),
                 class_name: Some("identity".to_string()),
                 runtime: Some("PYTHON".to_string()),
-                inputs: vec![format!("persistent://public/default/{}", unique("st-in"))],
+                inputs: vec![input_topic.clone()],
                 output: Some(format!("persistent://public/default/{}", unique("st-out"))),
                 parallelism: Some(1),
                 py: Some("identity.py".to_string()),
@@ -7067,6 +7209,9 @@ async fn function_stats_decode_the_brokers_nested_instances() {
             }
         })
         .await;
+        // Registering a function auto-creates its input topic; deleting the
+        // function does not remove it.
+        delete_topic_for_good(&admin, "public/default", &input_topic).await;
     })
     .await;
 }
@@ -7079,8 +7224,10 @@ async fn function_stats_decode_the_brokers_nested_instances() {
 #[tokio::test]
 async fn function_state_sends_byte_values_as_base64() {
     use crate::admin::models::FunctionState;
-    let (port, seen) =
-        serve_once("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_string()).await;
+    let (port, seen) = serve_once(
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+    )
+    .await;
     let admin = AdminClient::new(
         format!("http://127.0.0.1:{port}"),
         &crate::connection_manager::TlsOptions::default(),
@@ -7186,8 +7333,10 @@ async fn the_admin_request_timeout_is_configurable() {
 /// query parameters with no way to affect a real cluster.
 #[tokio::test]
 async fn broker_graceful_shutdown_builds_the_right_request() {
-    let (port, seen) =
-        serve_once("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_string()).await;
+    let (port, seen) = serve_once(
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+    )
+    .await;
     let admin = AdminClient::new(
         format!("http://127.0.0.1:{port}"),
         &crate::connection_manager::TlsOptions::default(),
@@ -7222,7 +7371,7 @@ async fn a_quoted_text_response_round_trips_exactly() {
     // The JSON encoding of the string `" quoted "` — quotes are part of the value.
     let payload = r#""\" quoted \"""#;
     let (port, _seen) = serve_once(format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{payload}",
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
     ))
     .await;
@@ -7341,7 +7490,7 @@ async fn health_check_requires_an_ok_body() {
     // byte short meant this asserted against a truncated body.
     let payload = "namespace is not writable";
     let (port, _seen) = serve_once(format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{payload}",
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
     ))
     .await;
@@ -7377,6 +7526,10 @@ async fn non_persistent_group_rejects_a_persistent_topic() {
 }
 
 /// Serves a fixed sequence of responses, recording every request it sees.
+// Every response these stubs write carries `Connection: close`. Each accepts one
+// connection per response and drops the socket afterwards, so without it hyper
+// keeps the connection pooled, reuses it for the next request, and races the
+// close — surfacing intermittently as `hyper::Error(IncompleteMessage)`.
 async fn serve_sequence(
     responses: Vec<String>,
 ) -> (u16, std::sync::Arc<tokio::sync::Mutex<Vec<SeenRequest>>>) {
@@ -7441,7 +7594,7 @@ async fn serve_sequence(
 
 fn ok_body(body: &str) -> String {
     format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
 }
@@ -7454,7 +7607,7 @@ fn redirect(status: u16, location: &str) -> String {
         307 => "Temporary Redirect",
         _ => "Permanent Redirect",
     };
-    format!("HTTP/1.1 {status} {reason}\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n")
+    format!("HTTP/1.1 {status} {reason}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 }
 
 async fn stub_admin(port: u16) -> AdminClient {
@@ -7571,7 +7724,8 @@ async fn a_relative_redirect_location_is_resolved() {
 #[tokio::test]
 async fn a_redirect_without_a_location_is_surfaced() {
     let (port, _seen) = serve_sequence(vec![
-        "HTTP/1.1 307 Temporary Redirect\r\nContent-Length: 0\r\n\r\n".to_string(),
+        "HTTP/1.1 307 Temporary Redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string(),
     ])
     .await;
     let admin = stub_admin(port).await;
@@ -7605,10 +7759,12 @@ async fn a_redirect_loop_is_bounded() {
 /// would have seen an unauthenticated request and answered 401/403.
 #[tokio::test]
 async fn authentication_survives_a_cross_origin_redirect() {
-    let (owner_port, owner_saw) =
-        serve_once("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]".to_string()).await;
+    let (owner_port, owner_saw) = serve_once(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]".to_string(),
+    )
+    .await;
     let (entry_port, entry_saw) = serve_once(format!(
-        "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{owner_port}/admin/v2/clusters\r\nContent-Length: 0\r\n\r\n"
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{owner_port}/admin/v2/clusters\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     ))
     .await;
 
@@ -7646,10 +7802,12 @@ async fn authentication_survives_a_cross_origin_redirect() {
 /// this client would then report as a confusing HTTP error.
 #[tokio::test]
 async fn multipart_uploads_follow_a_redirect_with_their_body() {
-    let (owner_port, owner_saw) =
-        serve_once("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_string()).await;
+    let (owner_port, owner_saw) = serve_once(
+        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+    )
+    .await;
     let (entry_port, _entry_saw) = serve_once(format!(
-        "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{owner_port}/upload\r\nContent-Length: 0\r\n\r\n"
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{owner_port}/upload\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     ))
     .await;
 

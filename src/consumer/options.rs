@@ -16,6 +16,16 @@ pub struct ConsumerOptions {
     /// marked-delete position on the particular message id and
     /// will send messages from that point
     pub start_message_id: Option<MessageIdData>,
+    /// Whether [`start_message_id`][Self::start_message_id] itself is delivered.
+    ///
+    /// `false` — the default, and Java's — treats it as a resume cursor: reading
+    /// begins at the message *after* it, so storing the id of the last message you
+    /// processed and restarting from it does not hand you that message twice.
+    /// `true` is Java's `startMessageIdInclusive()`.
+    ///
+    /// Only persistent topics are filtered; a non-persistent topic has no
+    /// position to resume from, and Java does not filter those either.
+    pub start_message_id_inclusive: bool,
     /// Add optional metadata key=value to this consumer
     pub metadata: BTreeMap<String, String>,
     pub read_compacted: Option<bool>,
